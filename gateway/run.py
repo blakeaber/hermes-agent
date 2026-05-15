@@ -26,12 +26,15 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import importlib.util
 import inspect
 import json
 import logging
 import os
 import re
+import secrets
 import shlex
+import sqlite3
 import sys
 import signal
 import tempfile
@@ -5784,7 +5787,19 @@ class GatewayRunner:
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-        
+
+        # ── Plan 005-B: Rooben prefix-based routing ─────────────────────────
+        # Deterministic opt-in: messages starting with "plan:" or "/workflow "
+        # go to the Rooben DAG dispatcher instead of free-form run_conversation.
+        # Check runs AFTER auth (authorized users only) and BEFORE all other
+        # dispatch (commands, clarify intercepts, running-agent guard).
+        _rooben_text = (event.text or "").lstrip()
+        for _rooben_prefix in ("plan:", "/workflow "):
+            if _rooben_text.lower().startswith(_rooben_prefix):
+                _rooben_nl_request = _rooben_text[len(_rooben_prefix):].strip()
+                return await self._dispatch_to_rooben(event, _rooben_nl_request)
+        # ────────────────────────────────────────────────────────────────────
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -16202,6 +16217,245 @@ class GatewayRunner:
                 logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
 
         return response
+
+    # ── Plan 005-B: Rooben DAG dispatcher integration ───────────────────────
+
+    async def _dispatch_to_rooben(
+        self, event: "MessageEvent", nl_request: str
+    ) -> Optional[str]:
+        """Invoke the Rooben DAG dispatcher for a plan:/workflow-prefixed message.
+
+        This method:
+          1. Sends an immediate confirmation reply so the user isn't left waiting.
+          2. Loads run_pipeline from bridges/hermes-rooben/dag-dispatcher.py via
+             importlib (the file uses a hyphen so it can't be imported directly).
+          3. Launches run_pipeline as a background asyncio.Task (non-blocking).
+          4. Launches _watch_kanban_completions as a background asyncio.Task to
+             DM completion updates as individual DAG nodes finish.
+
+        Returns the confirmation string so _handle_message can propagate it.
+        """
+        correlation_id = secrets.token_hex(16)
+        short_id = correlation_id[:8]
+        logger.info(
+            "rooben_routing.dispatch nl=%r correlation_id=%s platform=%s",
+            nl_request[:80],
+            correlation_id,
+            event.source.platform.value if event.source.platform else "unknown",
+        )
+
+        # Send immediate acknowledgement via the platform adapter.
+        confirmation = (
+            f"\U0001f4cb Planning workflow… correlation_id=`{short_id}`. "
+            f"I'll DM updates as each task completes."
+        )
+        adapter = self.adapters.get(event.source.platform)
+        if adapter:
+            try:
+                reply_anchor = self._reply_anchor_for_event(event)
+                thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=confirmation,
+                    metadata=thread_meta,
+                )
+            except Exception as _send_exc:
+                logger.warning(
+                    "rooben_routing.send_confirmation_failed correlation_id=%s error=%s",
+                    correlation_id, _send_exc,
+                )
+
+        # Lazily load run_pipeline from the bridge (hyphen in filename prevents
+        # normal import — use importlib.util.spec_from_file_location).
+        # Re-use a cached module if already loaded in this process to avoid
+        # re-executing the module on every plan: request.
+        _bridge_path = os.path.expanduser(
+            "~/Documents/agentic-hub/bridges/hermes-rooben/dag-dispatcher.py"
+        )
+        try:
+            if "dag_dispatcher" not in sys.modules:
+                _spec = importlib.util.spec_from_file_location("dag_dispatcher", _bridge_path)
+                if _spec is None or _spec.loader is None:
+                    raise ImportError(f"Cannot find dag-dispatcher.py at {_bridge_path}")
+                _dag_dispatcher = importlib.util.module_from_spec(_spec)
+                # Register before exec_module so dataclass __module__ lookups work.
+                sys.modules["dag_dispatcher"] = _dag_dispatcher
+                try:
+                    _spec.loader.exec_module(_dag_dispatcher)  # type: ignore[union-attr]
+                except Exception:
+                    # Remove the partial module on failure so next call retries.
+                    sys.modules.pop("dag_dispatcher", None)
+                    raise
+            run_pipeline = sys.modules["dag_dispatcher"].run_pipeline
+        except Exception as _import_exc:
+            logger.error(
+                "rooben_routing.import_failed correlation_id=%s error=%s",
+                correlation_id, _import_exc,
+            )
+            return f"✗ Could not load Rooben dispatcher: {_import_exc}"
+
+        # Build a progress callback that sends Slack updates mid-pipeline.
+        def _progress(msg: str) -> None:
+            logger.info("rooben_routing.progress correlation_id=%s msg=%s", correlation_id, msg)
+
+        # Launch run_pipeline as a non-blocking background task.
+        _pipeline_task = asyncio.create_task(
+            run_pipeline(
+                nl_request=nl_request,
+                correlation_id=correlation_id,
+                wait_for_completion=False,
+                progress_fn=_progress,
+            ),
+            name=f"rooben-pipeline-{short_id}",
+        )
+
+        # Launch the kanban completion watcher.
+        asyncio.create_task(
+            self._watch_kanban_completions(correlation_id, event),
+            name=f"rooben-watcher-{short_id}",
+        )
+
+        # Log when the pipeline task itself completes (errors or success).
+        def _on_pipeline_done(task: asyncio.Task) -> None:
+            exc = task.exception() if not task.cancelled() else None
+            if exc:
+                logger.error(
+                    "rooben_routing.pipeline_failed correlation_id=%s error=%s",
+                    correlation_id, exc,
+                )
+            else:
+                logger.info(
+                    "rooben_routing.pipeline_done correlation_id=%s", correlation_id
+                )
+
+        _pipeline_task.add_done_callback(_on_pipeline_done)
+
+        # Return None — we already sent the confirmation via adapter.send.
+        return None
+
+    async def _watch_kanban_completions(
+        self, correlation_id: str, event: "MessageEvent"
+    ) -> None:
+        """Poll kanban.db for task completions tied to correlation_id.
+
+        Sends a DM update for each node that transitions to 'done' or 'blocked'.
+        Stops after all tasks resolve or after a 15-minute timeout.
+        """
+        kanban_db_path = os.path.expanduser("~/.hermes/kanban.db")
+        poll_interval_s = 30
+        timeout_s = 900  # 15 minutes
+        deadline = asyncio.get_event_loop().time() + timeout_s
+
+        seen_done: set[str] = set()
+        seen_blocked: set[str] = set()
+
+        adapter = self.adapters.get(event.source.platform)
+        chat_id = event.source.chat_id
+        thread_meta = self._thread_metadata_for_source(
+            event.source, self._reply_anchor_for_event(event)
+        )
+
+        async def _send_update(msg: str) -> None:
+            if adapter:
+                try:
+                    await adapter._send_with_retry(
+                        chat_id=chat_id,
+                        content=msg,
+                        metadata=thread_meta,
+                    )
+                except Exception as _exc:
+                    logger.warning(
+                        "rooben_watcher.send_failed correlation_id=%s error=%s",
+                        correlation_id, _exc,
+                    )
+
+        logger.info(
+            "rooben_watcher.start correlation_id=%s timeout=%ds", correlation_id, timeout_s
+        )
+
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(poll_interval_s)
+
+            if not os.path.exists(kanban_db_path):
+                logger.debug(
+                    "rooben_watcher.db_not_found correlation_id=%s path=%s",
+                    correlation_id, kanban_db_path,
+                )
+                continue
+
+            try:
+                conn = sqlite3.connect(kanban_db_path, check_same_thread=False)
+                try:
+                    cur = conn.execute(
+                        "SELECT id, status, body FROM tasks "
+                        "WHERE body LIKE ? AND status IN ('done', 'blocked')",
+                        (f"%{correlation_id}%",),
+                    )
+                    rows = cur.fetchall()
+                finally:
+                    conn.close()
+            except sqlite3.Error as _db_exc:
+                logger.warning(
+                    "rooben_watcher.db_error correlation_id=%s error=%s",
+                    correlation_id, _db_exc,
+                )
+                continue
+
+            all_terminal: list[str] = []
+            for task_id, status, body in rows:
+                all_terminal.append(task_id)
+                # Extract a brief summary from the body (first non-empty line after frontmatter)
+                _summary_lines = [
+                    ln.strip() for ln in (body or "").splitlines()
+                    if ln.strip() and not ln.startswith("---") and not ln.startswith("#")
+                ]
+                _summary = (_summary_lines[0] if _summary_lines else task_id)[:80]
+
+                if status == "done" and task_id not in seen_done:
+                    seen_done.add(task_id)
+                    await _send_update(f"✓ {task_id} done: {_summary}")
+                    logger.info(
+                        "rooben_watcher.task_done correlation_id=%s task_id=%s",
+                        correlation_id, task_id,
+                    )
+                elif status == "blocked" and task_id not in seen_blocked:
+                    seen_blocked.add(task_id)
+                    await _send_update(f"✗ {task_id} blocked: {_summary}")
+                    logger.info(
+                        "rooben_watcher.task_blocked correlation_id=%s task_id=%s",
+                        correlation_id, task_id,
+                    )
+
+            # If we've seen at least one terminal task and all known terminal
+            # tasks are accounted for, stop.  We stop eagerly once all rows
+            # are terminal rather than waiting for the full timeout.
+            if all_terminal and len(all_terminal) == len(seen_done) + len(seen_blocked):
+                logger.info(
+                    "rooben_watcher.all_resolved correlation_id=%s done=%d blocked=%d",
+                    correlation_id, len(seen_done), len(seen_blocked),
+                )
+                break
+
+        else:
+            # Timeout — send a summary of what we saw
+            total_seen = len(seen_done) + len(seen_blocked)
+            timeout_msg = (
+                f"⏱ Workflow `{correlation_id[:8]}` watcher timed out after 15 min. "
+                f"{len(seen_done)} done, {len(seen_blocked)} blocked, "
+                f"{total_seen} total transitions observed."
+            )
+            await _send_update(timeout_msg)
+            logger.warning(
+                "rooben_watcher.timeout correlation_id=%s done=%d blocked=%d",
+                correlation_id, len(seen_done), len(seen_blocked),
+            )
+
+        logger.info(
+            "rooben_watcher.exit correlation_id=%s done=%d blocked=%d",
+            correlation_id, len(seen_done), len(seen_blocked),
+        )
+
+    # ────────────────────────────────────────────────────────────────────────
 
 
 def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
