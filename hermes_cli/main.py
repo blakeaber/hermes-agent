@@ -5262,6 +5262,25 @@ def cmd_slack(args):
     return 1
 
 
+def cmd_slack_inject(args):
+    """Simulate a Slack DM by injecting a synthetic event directly into the handler.
+
+    Builds a Socket Mode ``message.im`` event dict and calls the Slack
+    adapter's ``_handle_slack_message()`` without going through a real
+    Socket Mode connection. Exercises everything from the adapter's message
+    handler downward, including Plan 005-B's prefix-routing classifier.
+
+    Examples::
+
+        hermes slack-inject "test ping"
+        hermes slack-inject "plan: research 1 PE firm"
+        hermes slack-inject "plan: ..." --user-id U123 --channel-id D456
+    """
+    from hermes_cli.slack_inject import slack_inject_command
+
+    return slack_inject_command(args)
+
+
 def cmd_kanban(args):
     """Multi-profile collaboration board."""
     from hermes_cli.kanban import kanban_command
@@ -9190,7 +9209,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory",
         "model", "pairing", "plugins", "profile", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "slack-inject", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "chat",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -9640,6 +9659,57 @@ def main():
         "into an existing manifest manually).",
     )
     slack_parser.set_defaults(func=cmd_slack)
+
+    # =========================================================================
+    # slack-inject command — Plan 005-C
+    # Simulate a Slack DM by injecting a synthetic event directly into the
+    # Slack adapter's _handle_slack_message() without Socket Mode.
+    # =========================================================================
+    slack_inject_parser = subparsers.add_parser(
+        "slack-inject",
+        help="Simulate a Slack DM by injecting a synthetic event (Plan 005-C)",
+        description=(
+            "Build a synthetic Slack Socket Mode 'message.im' event and call the "
+            "Slack adapter's _handle_slack_message() directly — without a real "
+            "Socket Mode connection. Exercises the full message-handler path, "
+            "including the Plan 005-B prefix-routing classifier (plan: / /workflow).\n\n"
+            "Examples:\n"
+            "  hermes slack-inject 'test ping'\n"
+            "  hermes slack-inject 'plan: research 1 PE firm'\n"
+            "  hermes slack-inject 'plan: ...' --user-id U123 --channel-id D456"
+        ),
+    )
+    slack_inject_parser.add_argument(
+        "text",
+        help="Message text to inject as the simulated user DM.",
+    )
+    slack_inject_parser.add_argument(
+        "--user-id",
+        dest="user_id",
+        default=None,
+        help=(
+            "Slack user ID to use as the message sender. "
+            "Defaults to the first value in SLACK_ALLOWED_USERS env var, "
+            "or 'U_INJECT_TEST' if that is not set."
+        ),
+    )
+    slack_inject_parser.add_argument(
+        "--channel-id",
+        dest="channel_id",
+        default=None,
+        help=(
+            "Slack channel/DM channel ID for the synthetic event. "
+            "Defaults to SLACK_DM_CHANNEL env var, "
+            "or 'D_TEST_CHANNEL' (with a warning) if that is not set."
+        ),
+    )
+    slack_inject_parser.add_argument(
+        "--thread-ts",
+        dest="thread_ts",
+        default=None,
+        help="Thread timestamp (thread_ts) to include in the event (optional).",
+    )
+    slack_inject_parser.set_defaults(func=cmd_slack_inject)
 
     # =========================================================================
     # login command
