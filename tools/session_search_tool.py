@@ -525,6 +525,19 @@ def session_search(
 
             summaries.append(entry)
 
+        # Plan 008-C: shadow-mode observability. Record what historical
+        # sessions session_search surfaced for this query — helps reason
+        # about when the agent picks this tool over Atlas, and what it
+        # finds. Diagnostic only; behavior unchanged.
+        try:
+            from tools._memory_shadow import log_session_search
+            log_session_search(
+                query=query,
+                result_session_ids=[s["session_id"] for s in summaries],
+            )
+        except Exception:
+            pass  # Never block on shadow-log failures.
+
         return json.dumps({
             "success": True,
             "query": query,

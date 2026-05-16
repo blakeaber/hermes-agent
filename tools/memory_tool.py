@@ -141,6 +141,17 @@ class MemoryStore:
             "user": self._render_block("user", self.user_entries),
         }
 
+        # Plan 008-C: shadow-log the snapshot fingerprint at session start
+        # so we can correlate "what the agent saw" with "what it later wrote."
+        try:
+            from tools._memory_shadow import log_memory_snapshot
+            log_memory_snapshot(
+                memory_content=self._system_prompt_snapshot["memory"],
+                user_content=self._system_prompt_snapshot["user"],
+            )
+        except Exception:
+            pass  # Never block on shadow-log failures.
+
     @staticmethod
     @contextmanager
     def _file_lock(path: Path):
@@ -499,6 +510,18 @@ def memory_tool(
 
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+
+    # Plan 008-C: shadow-mode observability. Diagnostic only — built-in
+    # memory writes continue to land on disk; this just records what was
+    # written so we can compare against Atlas later.
+    try:
+        from tools._memory_shadow import log_memory_write
+        # On `remove`, content is None; log the old_text instead so we
+        # still capture what was being removed.
+        _shadow_content = content if action != "remove" else old_text
+        log_memory_write(action=action, target=target, content=_shadow_content)
+    except Exception:
+        pass  # Never block the agent on shadow-log failures.
 
     return json.dumps(result, ensure_ascii=False)
 
