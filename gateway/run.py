@@ -3718,6 +3718,12 @@ class GatewayRunner:
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
 
+        # Plan 008-B: fast-poll watcher for on-demand session-finalize
+        # requests dropped by `hermes sessions finalize`. Lives alongside
+        # the 5-minute expiry watcher; this one polls every ~5s so the
+        # CLI feels interactive.
+        asyncio.create_task(self._finalize_request_watcher())
+
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
@@ -4135,6 +4141,146 @@ class GatewayRunner:
             return get_active_profile_name() or "default"
         except Exception:
             return "default"
+
+    async def _finalize_request_watcher(self, interval: float = 5.0) -> None:
+        """Plan 008-B: poll ~/.hermes/finalize-requested-* and finalize on-demand.
+
+        ``hermes sessions finalize [<key>|--all]`` drops a filesystem flag here;
+        this watcher picks it up within `interval` seconds and runs the same
+        finalize body the expiry watcher uses (invoke on_session_finalize hook,
+        evict cached agent, set entry.expiry_finalized, save). It then drops a
+        completion marker `~/.hermes/finalize-completed-<encoded-key>` and
+        unlinks the request flag.
+
+        Designed for UAT + debug — the natural expiry path stays the canonical
+        production trigger (24h idle). This adds an interactive override.
+        """
+        import os as _os
+        import urllib.parse as _urlparse
+        from pathlib import Path as _Path
+
+        hermes_home = _Path.home() / ".hermes"
+
+        # Initial delay so the gateway is fully started before the first poll.
+        await asyncio.sleep(10)
+
+        while self._running:
+            try:
+                if not hermes_home.is_dir():
+                    await asyncio.sleep(interval)
+                    continue
+
+                # Enumerate flags. Cheap: glob over a small dir.
+                request_flags = sorted(hermes_home.glob("finalize-requested-*"))
+                if not request_flags:
+                    await asyncio.sleep(interval)
+                    continue
+
+                self.session_store._ensure_loaded()
+                all_entries = list(self.session_store._entries.items())
+
+                for flag_path in request_flags:
+                    suffix = flag_path.name[len("finalize-requested-"):]
+                    if suffix == "ALL":
+                        targets = [(k, e) for k, e in all_entries if not e.expiry_finalized]
+                        log_target = "--all"
+                    else:
+                        try:
+                            decoded_key = _urlparse.unquote_plus(suffix)
+                        except Exception:
+                            decoded_key = suffix
+                        targets = [
+                            (k, e) for k, e in all_entries
+                            if k == decoded_key and not e.expiry_finalized
+                        ]
+                        log_target = decoded_key
+
+                    logger.info(
+                        "finalize_request_watcher: target=%s matched=%d",
+                        log_target, len(targets),
+                    )
+
+                    finalized_count = 0
+                    for key, entry in targets:
+                        try:
+                            # Invoke the on_session_finalize hook (mirrors
+                            # _session_expiry_watcher's call shape).
+                            try:
+                                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                                _parts = key.split(":")
+                                _platform = _parts[2] if len(_parts) > 2 else ""
+                                _invoke_hook(
+                                    "on_session_finalize",
+                                    session_id=entry.session_id,
+                                    platform=_platform,
+                                )
+                            except Exception as _he:
+                                logger.debug(
+                                    "finalize_request_watcher: hook invoke failed for %s: %s",
+                                    entry.session_id, _he,
+                                )
+
+                            # Mirror the expiry-watcher cleanup: evict cached
+                            # agent so memory provider + LLM clients release.
+                            _cached_agent = None
+                            _cache_lock = getattr(self, "_agent_cache_lock", None)
+                            if _cache_lock is not None:
+                                with _cache_lock:
+                                    _cached = self._agent_cache.get(key)
+                                    _cached_agent = (
+                                        _cached[0] if isinstance(_cached, tuple)
+                                        else _cached if _cached else None
+                                    )
+                            if _cached_agent is None:
+                                _cached_agent = self._running_agents.get(key)
+                            if _cached_agent and _cached_agent is not _AGENT_PENDING_SENTINEL:
+                                self._cleanup_agent_resources(_cached_agent)
+                            self._evict_cached_agent(key)
+
+                            # Mark finalized + persist.
+                            with self.session_store._lock:
+                                entry.expiry_finalized = True
+                                self.session_store._save()
+
+                            # Drop per-session completion marker so the CLI
+                            # poller can detect a specific finalize landed.
+                            encoded_key = _urlparse.quote_plus(key, safe="")
+                            marker = hermes_home / f"finalize-completed-{encoded_key}"
+                            try:
+                                marker.touch()
+                            except OSError as _me:
+                                logger.warning(
+                                    "finalize_request_watcher: marker write failed: %s",
+                                    _me,
+                                )
+                            finalized_count += 1
+                        except Exception as e:
+                            logger.warning(
+                                "finalize_request_watcher: finalize failed for %s: %s",
+                                key, e,
+                            )
+
+                    # Drop the request flag regardless — even if matched=0
+                    # (the requested session may have already been finalized
+                    # or expired naturally). Don't leave stale flags around.
+                    try:
+                        flag_path.unlink()
+                    except OSError:
+                        pass
+
+                    logger.info(
+                        "finalize_request_watcher: processed flag=%s finalized=%d",
+                        flag_path.name, finalized_count,
+                    )
+
+            except Exception as e:
+                logger.warning("finalize_request_watcher error: %s", e)
+
+            # Sleep in 1s increments for responsive shutdown.
+            for _ in range(int(interval)):
+                if not self._running:
+                    break
+                await asyncio.sleep(1)
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.

@@ -11041,6 +11041,38 @@ Examples:
     sessions_rename.add_argument("session_id", help="Session ID to rename")
     sessions_rename.add_argument("title", nargs="+", help="New title for the session")
 
+    # Plan 008-B: deterministic on-demand session finalize for UAT and
+    # debug work. Writes a filesystem flag the gateway's _finalize_request_
+    # watcher picks up within ~5s, fires the on_session_end hook, drops a
+    # completion marker. Without this, finalize only happens on natural
+    # idle expiry (default 24h).
+    sessions_finalize = sessions_subparsers.add_parser(
+        "finalize",
+        help="Force on_session_end hook to fire for a session (Plan 008-B)",
+        description=(
+            "Drops a filesystem flag the gateway picks up within ~5s, "
+            "calls on_session_finalize for matching sessions, drops a "
+            "completion marker. Use this in UAT or debug to bypass the "
+            "24h idle-expiry wait."
+        ),
+    )
+    sessions_finalize.add_argument(
+        "session_key",
+        nargs="?",
+        help="Session key to finalize (e.g. 'agent:main:slack:dm:U123'). Omit with --all.",
+    )
+    sessions_finalize.add_argument(
+        "--all",
+        action="store_true",
+        help="Finalize every currently-open session.",
+    )
+    sessions_finalize.add_argument(
+        "--wait",
+        type=int,
+        default=30,
+        help="Seconds to wait for completion marker before giving up (default: 30, 0 = fire-and-forget).",
+    )
+
     sessions_browse = sessions_subparsers.add_parser(
         "browse",
         help="Interactive session picker — browse, search, and resume sessions",
@@ -11204,6 +11236,81 @@ Examples:
 
             relaunch(["--resume", selected_id])
             return  # won't reach here after execvp
+
+        elif action == "finalize":
+            # Plan 008-B: drop a filesystem flag the gateway watcher picks up.
+            import time as _time
+            import urllib.parse as _urlparse
+
+            hermes_home = Path.home() / ".hermes"
+            hermes_home.mkdir(parents=True, exist_ok=True)
+
+            if args.all:
+                flag_name = "finalize-requested-ALL"
+                target_desc = "all open sessions"
+            elif args.session_key:
+                # URL-encode the key so : / etc don't break filesystem semantics
+                encoded = _urlparse.quote_plus(args.session_key, safe="")
+                flag_name = f"finalize-requested-{encoded}"
+                target_desc = args.session_key
+            else:
+                print("error: provide a session_key or --all", file=sys.stderr)
+                db.close()
+                return 2
+
+            flag_path = hermes_home / flag_name
+            flag_path.touch()
+            print(f"finalize requested: {target_desc} (flag: {flag_path.name})")
+
+            if args.wait <= 0:
+                print("fire-and-forget mode — not waiting for completion")
+                db.close()
+                return 0
+
+            # Poll for completion. Gateway signals acknowledgement by
+            # unlinking the request flag (always — even when matched=0,
+            # which is a valid case if no sessions are currently open).
+            # For specific session_key, additionally wait for the per-key
+            # marker since the user wants confirmation THEIR session was
+            # finalized.
+            req_mtime = flag_path.stat().st_mtime
+            deadline = _time.time() + args.wait
+            done = False
+            while _time.time() < deadline:
+                # Flag unlinked = gateway processed (matched-or-not).
+                if not flag_path.exists():
+                    if args.all:
+                        done = True
+                        break
+                    # For specific key: ALSO require the marker exists with
+                    # mtime ≥ request time, proving a finalize actually ran.
+                    marker = hermes_home / f"finalize-completed-{encoded}"
+                    if marker.exists() and marker.stat().st_mtime >= req_mtime:
+                        done = True
+                        break
+                    # Flag gone but no marker → session_key didn't match any
+                    # open entry. Report this distinctly.
+                    print(
+                        f"warning: gateway processed the request but session_key "
+                        f"{target_desc!r} did not match any open session (already finalized?).",
+                        file=sys.stderr,
+                    )
+                    db.close()
+                    return 0
+                _time.sleep(1)
+
+            if done:
+                print(f"finalize completed for {target_desc}")
+                db.close()
+                return 0
+            else:
+                print(
+                    f"timed out after {args.wait}s waiting for completion marker. "
+                    f"The request flag {flag_path.name} remains; gateway may still process it.",
+                    file=sys.stderr,
+                )
+                db.close()
+                return 1
 
         elif action == "stats":
             total = db.session_count()
