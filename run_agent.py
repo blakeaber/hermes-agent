@@ -1906,6 +1906,15 @@ class AIAgent:
         except Exception:
             pass  # CLI/test mode — ContextVar not needed
 
+        # Plan 002-D: validate operator HERMES_* env vars early so
+        # misconfiguration surfaces at session start rather than failing
+        # silently mid-session.  Non-strict: logs errors, never blocks startup.
+        try:
+            from scripts.validate_env import validate_hermes_env
+            validate_hermes_env(strict=False)
+        except Exception:
+            pass  # validation itself must never crash startup
+
         # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
         hermes_home = get_hermes_home()
         self.logs_dir = hermes_home / "sessions"

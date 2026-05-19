@@ -12,7 +12,7 @@
 | 002-A | Directory Layout Migration | Complete (2026-05-19) | 23 new tests pass, 0 regressions |
 | 002-B | Runtime Session Isolation | Complete (2026-05-19) | 15 new tests pass, 0 regressions |
 | 002-C | MCP Connection Pool (MCPGateway) | Not started | Blocked by 002-B |
-| 002-D | Cloud Env-Var Routing | Not started | Blocked by 002-A only; can run parallel with B/C |
+| 002-D | Cloud Env-Var Routing | Complete (2026-05-19) | 18 new tests pass, 0 regressions |
 
 ## Open Questions (Blake must resolve before Phase C begins)
 
