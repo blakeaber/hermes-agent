@@ -851,6 +851,15 @@ def _promote_skill(name: str, target_scope: str = "team") -> Dict[str, Any]:
 # Main entry point
 # =============================================================================
 
+def _is_saas_mode() -> bool:
+    """Return True when HERMES_MODE=saas is set in the environment.
+
+    All cloud-routing branches are gated on this flag so local dev is never
+    affected by S3 availability or missing boto3.
+    """
+    return os.environ.get("HERMES_MODE", "").lower() == "saas"
+
+
 def skill_manage(
     action: str,
     name: str,
@@ -863,12 +872,91 @@ def skill_manage(
     replace_all: bool = False,
     absorbed_into: str = None,
     target_scope: str = None,
+    # Optional: HermesIdentity passed through from agent context in SaaS mode.
+    # Must be keyword-only to avoid breaking existing callers (Phase 0 contract).
+    identity=None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
 
+    In SaaS mode (HERMES_MODE=saas) write operations route through S3 via
+    tools.skills_scoped.  Read operations remain filesystem-based for now
+    (Phase D adds full cloud storage).  Local mode behaviour is completely
+    unchanged — no S3 calls are made.
+
     Returns JSON string with results.
     """
+    # ------------------------------------------------------------------
+    # SaaS mode: route create / edit to scoped S3 storage.
+    # Other actions (patch, write_file, remove_file) still operate on the
+    # local filesystem — S3-only paths land in Phase D.
+    # ------------------------------------------------------------------
+    if _is_saas_mode() and identity is not None:
+        from tools.skills_scoped import write_skill, resolve_skill
+
+        if action == "create":
+            if not content:
+                return tool_error(
+                    "content is required for 'create'. Provide the full SKILL.md text.",
+                    success=False,
+                )
+            err = _validate_name(name)
+            if err:
+                return tool_error(err, success=False)
+            err = _validate_frontmatter(content)
+            if err:
+                return tool_error(err, success=False)
+            err = _validate_content_size(content)
+            if err:
+                return tool_error(err, success=False)
+            try:
+                write_skill(name, content, scope="personal", identity=identity)
+            except Exception as exc:
+                return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "success": True,
+                    "message": f"Skill '{name}' created in personal S3 scope.",
+                    "scope": "personal",
+                    "s3_prefix": identity.personal_scope,
+                },
+                ensure_ascii=False,
+            )
+
+        if action == "edit":
+            if not content:
+                return tool_error(
+                    "content is required for 'edit'. Provide the full updated SKILL.md text.",
+                    success=False,
+                )
+            err = _validate_frontmatter(content)
+            if err:
+                return tool_error(err, success=False)
+            err = _validate_content_size(content)
+            if err:
+                return tool_error(err, success=False)
+            existing = resolve_skill(name, identity)
+            if existing is None:
+                return json.dumps(
+                    {"success": False, "error": f"Skill '{name}' not found in any scope."},
+                    ensure_ascii=False,
+                )
+            try:
+                write_skill(name, content, scope="personal", identity=identity)
+            except Exception as exc:
+                return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "success": True,
+                    "message": f"Skill '{name}' updated in personal S3 scope.",
+                    "scope": "personal",
+                },
+                ensure_ascii=False,
+            )
+
+    # ------------------------------------------------------------------
+    # Local mode (or saas mode without identity): original filesystem path.
+    # ------------------------------------------------------------------
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
@@ -1071,6 +1159,8 @@ registry.register(
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
-        absorbed_into=args.get("absorbed_into")),
+        absorbed_into=args.get("absorbed_into"),
+        # Pass HermesIdentity from agent context kwargs if available (SaaS mode).
+        identity=kw.get("identity")),
     emoji="📝",
 )
