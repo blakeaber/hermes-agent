@@ -221,8 +221,10 @@ resource "aws_iam_policy" "skills_rw" {
 }
 
 # Attach the policy to the Fargate task role.
+# Note: aws_iam_role_policy_attachment requires the role NAME, not the ARN.
+# Extract the role name from the ARN format `arn:aws:iam::<acct>:role/<name>`.
 resource "aws_iam_role_policy_attachment" "skills_fargate" {
-  role       = var.fargate_task_role_arn
+  role       = element(split("/", var.fargate_task_role_arn), length(split("/", var.fargate_task_role_arn)) - 1)
   policy_arn = aws_iam_policy.skills_rw.arn
 }
 
