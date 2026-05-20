@@ -1,0 +1,94 @@
+# docker-compose.saas.yml — Local SaaS mode stack for Phase E development/testing.
+#
+# Purpose: full SaaS stack runnable on a developer laptop against real cloud deps:
+#   - Neon PostgreSQL (external; DSN from .env or env vars)
+#   - S3 skills bucket (external; boto3 uses local AWS credentials / IAM role)
+#   - DynamoDB skill-locks table (external; same credentials)
+#
+# No EFS, no whisper sidecar, no persistent volumes. The container is stateless.
+#
+# Usage:
+#   cp .env.example .env.saas            # add NEON_DATABASE_URL, SLACK_*,  etc.
+#   docker compose -f docker-compose.saas.yml up
+#
+# Required env vars (in .env.saas or exported in shell):
+#   NEON_DATABASE_URL   — postgresql://hermes_app:<pw>@<host>.neon.tech/hermes
+#   SLACK_BOT_TOKEN     — xoxb-...
+#   SLACK_APP_TOKEN     — xapp-...
+#   OPENAI_API_KEY      — or PORTKEY key if routing through Portkey
+#   S3_SKILLS_BUCKET    — hermes-saas-skills (default; override if needed)
+#   AWS_DEFAULT_REGION  — us-east-1 (default)
+#
+# Optional (for local AWS credential pass-through):
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+#   (Alternatively mount ~/.aws as a read-only volume.)
+
+services:
+  hermes-saas:
+    build:
+      context: .
+      dockerfile: Dockerfile.saas
+    image: hermes-saas:local
+    container_name: hermes-saas
+
+    # SaaS mode environment
+    environment:
+      HERMES_MODE: "saas"
+      HERMES_HOME: "/tmp/hermes-runtime"
+      HERMES_LOG_LEVEL: "${HERMES_LOG_LEVEL:-INFO}"
+
+      # Neon DSN — set in .env.saas or host env
+      NEON_DATABASE_URL: "${NEON_DATABASE_URL}"
+
+      # S3 / DynamoDB
+      S3_SKILLS_BUCKET: "${S3_SKILLS_BUCKET:-hermes-saas-skills}"
+      HERMES_SKILL_LOCKS_TABLE: "${HERMES_SKILL_LOCKS_TABLE:-hermes-skill-locks}"
+      AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-us-east-1}"
+
+      # Slack (socket mode — no public URL needed)
+      SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN}"
+      SLACK_APP_TOKEN: "${SLACK_APP_TOKEN}"
+
+      # LLM provider
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+
+      # AWS credentials (pass-through for local dev)
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+
+    # Health probe: mirrors ECS container health check
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    ports:
+      # Health check port (also serves api_server if HERMES_GATEWAY_PLATFORM=api_server)
+      - "8080:8080"
+
+    # No volume mounts — stateless. HERMES_HOME is /tmp inside the container.
+    # All persistent state is in Neon + S3.
+
+    # Restart policy: on-failure mirrors ECS task restart behavior.
+    restart: on-failure
+
+    # Resource limits: mirrors ECS task definition (1024 CPU / 3072 MB).
+    # Adjust for local dev if needed.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "3072M"
+
+    # Mount local AWS config for credential pass-through (read-only).
+    # Comment out if using IAM role / environment variable credentials.
+    volumes:
+      - type: bind
+        source: ${HOME}/.aws
+        target: /home/hermes/.aws
+        read_only: true
+        # Bind is optional — remove this block if running with env var credentials.
