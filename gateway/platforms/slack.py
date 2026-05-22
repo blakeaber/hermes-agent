@@ -316,6 +316,10 @@ class SlackAdapter(BasePlatformAdapter):
         self._team_clients: Dict[str, Any] = {}   # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}          # team_id → bot_user_id
         self._channel_team: Dict[str, str] = {}                # channel_id → team_id
+        # Plan 004-A: tenant UUID cache. Populated once per workspace at Slack
+        # auth time so feedback_capture.register_output finds an existing row
+        # via _resolve_tenant_id without any inbound-message-path round-trip.
+        self._tenant_id_by_team: Dict[str, str] = {}           # team_id → tenant UUID
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
@@ -592,6 +596,11 @@ class SlackAdapter(BasePlatformAdapter):
                     bot_name, team_name, team_id,
                 )
 
+                # Plan 004-A: bootstrap tenant row once per workspace.
+                # Best-effort: if Neon is unreachable the gateway keeps running;
+                # feedback capture just stays disabled until next reload.
+                await self._bootstrap_tenant(team_id)
+
             # Register message event handler
             @self._app.event("message")
             async def handle_message_event(event, say):
@@ -835,32 +844,33 @@ class SlackAdapter(BasePlatformAdapter):
                     for old_ts in list(self._bot_message_ts)[:excess]:
                         self._bot_message_ts.discard(old_ts)
 
-            # Plan 004-A: register skill output for feedback correlation.
-            # If metadata carries a "skill_name" key, store (slack_ts, channel_id) →
-            # skill_name in skill_output_map so reactions on this message can be
-            # correlated back to the skill that produced it.
-            # Best-effort: failure is logged but never raised.
-            skill_name = (metadata or {}).get("skill_name", "")
-            if sent_ts and skill_name:
-                pool = self._get_neon_pool()
-                if pool is not None:
-                    try:
-                        team_id = (
-                            (list(self._team_bot_user_ids.keys())[:1] or [""])[0]
-                        )
-                        from hermes_agent.self_improvement.feedback_capture import register_output
-                        await register_output(
-                            pool=pool,
-                            platform="slack",
-                            team_id=team_id,
-                            channel_id=chat_id,
-                            slack_ts=sent_ts,
-                            skill_name=skill_name,
-                        )
-                    except Exception as _roe:
-                        logger.debug(
-                            "[Slack] Plan 004-A register_output error: %s", _roe
-                        )
+            # Plan 004-A: register every Hermes output for feedback correlation.
+            # Default skill_name to "_agent_default" when the response did not come
+            # from an explicit skill — reactions on plain agent replies should still
+            # be capturable; downstream scorers can filter by skill_name if needed.
+            # Skipped only when the tenant bootstrap never succeeded (no Neon).
+            if sent_ts:
+                team_id = (
+                    (list(self._team_bot_user_ids.keys())[:1] or [""])[0]
+                )
+                if team_id and self._tenant_id_by_team.get(team_id):
+                    pool = self._get_neon_pool()
+                    if pool is not None:
+                        skill_name = (metadata or {}).get("skill_name") or "_agent_default"
+                        try:
+                            from hermes_agent.self_improvement.feedback_capture import register_output
+                            await register_output(
+                                pool=pool,
+                                platform="slack",
+                                team_id=team_id,
+                                channel_id=chat_id,
+                                slack_ts=sent_ts,
+                                skill_name=skill_name,
+                            )
+                        except Exception as _roe:
+                            logger.debug(
+                                "[Slack] Plan 004-A register_output error: %s", _roe
+                            )
 
             return SendResult(
                 success=True,
@@ -1327,6 +1337,56 @@ class SlackAdapter(BasePlatformAdapter):
         return text
 
     # ----- Plan 004-A: Skill feedback capture (reaction_added / reaction_removed) -----
+
+    async def _bootstrap_tenant(self, team_id: str) -> None:
+        """
+        Ensure a tenants row exists for (platform=slack, external_id=team_id).
+
+        Called once per workspace at auth time. Idempotent (ON CONFLICT DO NOTHING).
+        Caches the resolved UUID in self._tenant_id_by_team so register_output and
+        reaction handlers can rely on the row existing without re-querying.
+
+        Best-effort: failure is logged but never raised — feedback capture is
+        telemetry, not a critical path.
+        """
+        if not team_id:
+            return
+        if team_id in self._tenant_id_by_team:
+            return  # already bootstrapped this session
+        pool = self._get_neon_pool()
+        if pool is None:
+            return  # not in saas mode or pool not up yet
+        try:
+            import uuid as _uuid
+            slug = f"slack_{team_id}"
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT id FROM tenants WHERE platform = $1 AND external_id = $2",
+                    "slack", team_id,
+                )
+                if row is None:
+                    new_id = str(_uuid.uuid4())
+                    await conn.execute(
+                        "INSERT INTO tenants (id, platform, external_id, slug, tier) "
+                        "VALUES ($1, $2, $3, $4, 'free') "
+                        "ON CONFLICT (platform, external_id) DO NOTHING",
+                        new_id, "slack", team_id, slug,
+                    )
+                    row = await conn.fetchrow(
+                        "SELECT id FROM tenants WHERE platform = $1 AND external_id = $2",
+                        "slack", team_id,
+                    )
+                tenant_id = str(row["id"])
+                self._tenant_id_by_team[team_id] = tenant_id
+                logger.info(
+                    "[Slack] Plan 004-A tenant bootstrap: team=%s → %s",
+                    team_id, tenant_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[Slack] Plan 004-A tenant bootstrap failed for team=%s: %s",
+                team_id, exc,
+            )
 
     def _get_neon_pool(self):
         """
