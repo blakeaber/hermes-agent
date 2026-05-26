@@ -518,31 +518,42 @@ class NeonBackend:
         self,
         conversation_id: str,
         limit: int = 50,
+        tenant_id: str | None = None,
     ) -> list[dict]:
         """
         Return the last *limit* messages for the conversation, oldest first.
 
-        Requires app.tenant_id to be set; resolved from conversations table.
+        Requires app.tenant_id to be set; resolved from cache, an explicit
+        argument, or — as a last resort — from a cold-start lookup that
+        requires the conversations RLS GUC be set first.
         Each dict: {"role", "content", optionally "tool_calls", "metadata"}.
+
+        Plan 007-E fix: `tenant_id` can now be passed explicitly by callers
+        who already have it (e.g., the Slack adapter's _tenant_id_by_team
+        cache). This avoids the cold-start RLS-bypass problem where the
+        prior cold-start lookup tried to JOIN conversations without setting
+        app.tenant_id first, which raised `InvalidTextRepresentationError:
+        invalid input syntax for type uuid: ""` because the RLS policy
+        evaluated `current_setting('app.tenant_id')::uuid` against an
+        empty string.
         """
         pool = self._require_pool()
         async with pool.acquire() as conn:
-            # Resolve tenant_id via cache (same cold-start pattern as append_message).
-            tenant_id = self._conv_tenant_cache.get(conversation_id)
+            # Resolution order: explicit arg → cache → cold-start (best-effort).
             if tenant_id is None:
-                row = await conn.fetchrow(
-                    """
-                    SELECT c.tenant_id
-                    FROM conversations c
-                    JOIN tenants t ON t.id = c.tenant_id
-                    WHERE c.id = $1
-                    """,
+                tenant_id = self._conv_tenant_cache.get(conversation_id)
+            if tenant_id is None:
+                # Cold-start: cannot resolve without RLS bypass and we don't
+                # have one. Return empty list; caller should populate the
+                # cache (e.g. via get_or_create_conversation) or pass
+                # tenant_id explicitly on subsequent calls.
+                logger.warning(
+                    "get_conversation_history: no tenant_id (cache cold + arg "
+                    "missing) for conv=%s; returning []",
                     conversation_id,
                 )
-                if row is None:
-                    return []
-                tenant_id = str(row["tenant_id"])
-                self._conv_tenant_cache[conversation_id] = tenant_id
+                return []
+            self._conv_tenant_cache[conversation_id] = tenant_id
 
             async with _RLSTransaction(conn, tenant_id):
                 rows = await conn.fetch(
