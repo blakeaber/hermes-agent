@@ -72,4 +72,12 @@ cd /Users/blakeaber/Documents/hermes-agent
 ```
 
 ## Status
-Not started
+Complete — 2026-05-25
+
+### Adaptations
+- Original plan wired through `SessionStore`. Live inspection showed SessionStore has zero existing calls into NeonBackend, and that the natural insertion point for "every Slack message in Neon" is the Slack adapter itself (where tenant_id, identity, channel_id, thread_ts are all immediately in scope).
+- Pivoted Phase 007-C scope: hook the two Slack adapter call sites instead. User turn writes from `_handle_slack_message` (right after `hermes_identity` is constructed); assistant turn writes from `send` adjacent to the existing Plan 004-A `register_output` hook.
+- `_conv_id_by_chat: Dict[(chat_id, thread_ts), conv_uuid]` cache populated lazily on first inbound message per thread.
+- `SessionStore` left untouched. The "JSONL drop in saas mode" original sub-goal is deferred to Plan 005 (Fargate cutover) where it actually matters; local launchd still uses disk normally.
+- Live integration verified end-to-end: probe persisted user + assistant turns; both rows visible in Neon `messages` table with correct conversation_id linkage and metadata (`slack_ts`, `slack_user_id`).
+- Regression sweep: 380 passed + 5 skipped + 0 failed across the full pytest run (8 unrelated ImportErrors in acp/browser/plugin test modules — pre-existing, not from this phase).

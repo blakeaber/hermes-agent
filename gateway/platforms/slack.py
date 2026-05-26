@@ -320,6 +320,11 @@ class SlackAdapter(BasePlatformAdapter):
         # auth time so feedback_capture.register_output finds an existing row
         # via _resolve_tenant_id without any inbound-message-path round-trip.
         self._tenant_id_by_team: Dict[str, str] = {}           # team_id → tenant UUID
+        # Plan 007-C: conversation UUID cache. (chat_id, thread_ts or "") → conv UUID.
+        # Populated lazily on first inbound message per Slack thread so
+        # NeonBackend.append_message has a stable conversation handle without
+        # calling get_or_create_conversation on every turn.
+        self._conv_id_by_chat: Dict[Tuple[str, str], str] = {} # (chat_id, thread_ts) → conv UUID
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
@@ -844,6 +849,22 @@ class SlackAdapter(BasePlatformAdapter):
                     for old_ts in list(self._bot_message_ts)[:excess]:
                         self._bot_message_ts.discard(old_ts)
 
+            # Plan 007-C: persist assistant turn to Neon messages (saas mode).
+            # Uses cached conversation_id from the prior user turn — silent skip
+            # if cache miss (e.g., bot-initiated message with no prior user turn).
+            if sent_ts:
+                try:
+                    await self._neon_persist_message(
+                        chat_id=chat_id,
+                        thread_ts=thread_ts or None,
+                        role="assistant",
+                        content=content or "",
+                        slack_ts=sent_ts,
+                        hermes_identity=None,  # cache lookup only
+                    )
+                except Exception as _e:
+                    logger.debug("[Slack] Plan 007-C assistant-turn persist error: %s", _e)
+
             # Plan 004-A: register every Hermes output for feedback correlation.
             # Default skill_name to "_agent_default" when the response did not come
             # from an explicit skill — reactions on plain agent replies should still
@@ -1335,6 +1356,66 @@ class SlackAdapter(BasePlatformAdapter):
             text = text.replace(key, placeholders[key])
 
         return text
+
+    # ----- Plan 007-C: Slack message persistence to Neon (saas mode) -----
+
+    async def _neon_persist_message(
+        self,
+        chat_id: str,
+        thread_ts: Optional[str],
+        role: str,
+        content: str,
+        slack_ts: Optional[str],
+        hermes_identity: Optional["HermesIdentity"] = None,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Persist one Slack turn to Neon `messages` (Plan 007-C).
+
+        Best-effort: failures swallowed (debug-logged) — message flow must
+        never block on the audit path. Skipped silently when:
+          - HERMES_MODE != saas (no Neon pool)
+          - Tenant bootstrap never succeeded (no tenant_id in cache)
+          - hermes_identity missing AND no cached conversation_id for chat
+
+        First call per (chat_id, thread_ts) resolves conversation via
+        backend.get_or_create_conversation and caches the UUID; subsequent
+        calls hit cache. Both user turns (from _handle_slack_message) and
+        assistant turns (from send) route through here.
+        """
+        if not content:
+            return
+        pool = self._get_neon_pool()
+        if pool is None:
+            return
+        cache_key = (chat_id, thread_ts or "")
+        try:
+            import hermes_storage as _hs
+            backend = _hs._backend
+            if backend is None:
+                return
+            conv_id = self._conv_id_by_chat.get(cache_key)
+            if conv_id is None:
+                if hermes_identity is None:
+                    # Assistant turn arrived before any user turn cached a
+                    # conversation — skip silently. Inbound path will fill
+                    # the cache on next user message.
+                    return
+                conv_id = await backend.get_or_create_conversation(
+                    hermes_identity, chat_id, thread_ts
+                )
+                self._conv_id_by_chat[cache_key] = conv_id
+            md = {"slack_ts": slack_ts} if slack_ts else {}
+            if extra_metadata:
+                md.update(extra_metadata)
+            await backend.append_message(
+                conv_id, role, content, tool_calls=None, metadata=md,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[Slack] Plan 007-C persist failed (role=%s chat=%s thread=%s): %s",
+                role, chat_id, thread_ts, exc,
+            )
 
     # ----- Plan 004-A: Skill feedback capture (reaction_added / reaction_removed) -----
 
@@ -2411,6 +2492,21 @@ class SlackAdapter(BasePlatformAdapter):
             thread_id=thread_ts,
         )
         source.hermes_identity = hermes_identity
+
+        # Plan 007-C: persist user turn to Neon messages (saas mode only).
+        # Best-effort; never blocks the agent dispatch even if Neon is down.
+        try:
+            await self._neon_persist_message(
+                chat_id=channel_id,
+                thread_ts=thread_ts or None,
+                role="user",
+                content=text or "",
+                slack_ts=event.get("ts"),
+                hermes_identity=hermes_identity,
+                extra_metadata={"slack_user_id": str(user_id)} if user_id else None,
+            )
+        except Exception as _e:
+            logger.debug("[Slack] Plan 007-C user-turn persist error: %s", _e)
 
         # Per-channel ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt, resolve_channel_skills
