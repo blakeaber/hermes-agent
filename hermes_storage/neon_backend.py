@@ -455,6 +455,65 @@ class NeonBackend:
                 )
                 return msg_id
 
+    async def append_raw_event(
+        self,
+        tenant_id: str,
+        conversation_id: str | None,
+        event_kind: str,
+        platform_message_id: str | None,
+        raw_payload: dict,
+    ) -> str | None:
+        """
+        Plan 007-A: append one row to raw_events (compliance audit log).
+
+        Best-effort. Failures are swallowed (logged at debug) — the audit path
+        MUST NEVER raise, since it sits beside user-facing message flows.
+
+        Idempotency: the table's partial unique index on
+        (tenant_id, conversation_id, event_kind, platform_message_id) WHERE
+        platform_message_id IS NOT NULL means Slack redeliveries land as
+        ON CONFLICT DO NOTHING — first-write wins, no error to caller.
+        """
+        try:
+            pool = self._require_pool()
+        except Exception as exc:
+            logger.debug("NeonBackend.append_raw_event: pool unavailable: %s", exc)
+            return None
+
+        try:
+            payload_json = json.dumps(raw_payload) if raw_payload is not None else "{}"
+            async with pool.acquire() as conn:
+                async with _RLSTransaction(conn, tenant_id):
+                    # Dedup key (per migration 007): (tenant_id, event_kind,
+                    # platform_message_id) WHERE platform_message_id IS NOT NULL.
+                    # conversation_id was dropped from the key because NULL
+                    # values broke uniqueness for events arriving before a
+                    # conversation is established.
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO raw_events
+                            (tenant_id, conversation_id, event_kind,
+                             platform_message_id, raw_payload)
+                        VALUES ($1, $2, $3, $4, $5::jsonb)
+                        ON CONFLICT (tenant_id, event_kind, platform_message_id)
+                            WHERE platform_message_id IS NOT NULL
+                            DO NOTHING
+                        RETURNING id
+                        """,
+                        tenant_id, conversation_id, event_kind,
+                        platform_message_id, payload_json,
+                    )
+                    if row is None:
+                        # idempotent duplicate — already audited
+                        return None
+                    return str(row["id"])
+        except Exception as exc:
+            logger.debug(
+                "NeonBackend.append_raw_event failed (kind=%s msg_id=%s): %s",
+                event_kind, platform_message_id, exc,
+            )
+            return None
+
     async def get_conversation_history(
         self,
         conversation_id: str,

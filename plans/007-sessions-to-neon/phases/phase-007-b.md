@@ -34,15 +34,14 @@ Phase 007-A complete (`raw_events` table exists in Neon, `sessions` / `messages`
 5. **SQLiteBackend stubs are OK.** Per Plan 007 design decision #1, the backend selection happens at `SessionStore.__init__`. SQLite mode keeps using the existing `SessionDB` for session-entry CRUD — these new methods only need to exist as `NotImplementedError("session-entry CRUD via StorageBackend is saas-mode only — use SessionDB in local mode")`. This keeps the interface honest without forcing duplicate work.
 6. **Idempotency for `append_raw_event`.** Use `(tenant_id, session_id, event_kind, platform_message_id)` as a UNIQUE index in the table — Phase 007-A should add this if not present. The Python method swallows unique-violation errors as success (Slack redeliveries are common).
 
-## Acceptance Criteria
-- [ ] `pytest tests/test_neon_backend_sessions.py -v` — 5 tests pass
-- [ ] `NeonBackend` has 5 new methods: `create_session`, `get_session`, `update_session_metadata`, `list_sessions_for_tenant`, `append_raw_event`
-- [ ] All 5 methods are wrapped in `_RLSTransaction(conn, tenant_id)` for both reads and writes
-- [ ] `StorageBackend` abstract base declares all 5 methods (with proper async signatures)
-- [ ] `SQLiteBackend` either implements minimally OR raises `NotImplementedError` with a clear saas-only message — both are acceptable
-- [ ] 2-tenant fixture test in `test_list_sessions_for_tenant_rls` proves tenant A's query returns zero of tenant B's rows
-- [ ] `append_raw_event` is idempotent — calling it twice with same `(tenant_id, session_id, event_kind, platform_message_id)` does not raise and does not double-write
-- [ ] No regressions: `pytest tests/test_storage*.py tests/test_neon*.py -v` all pass
+## Acceptance Criteria (revised — see Adaptations)
+- [x] 4 new unit tests in `tests/test_storage_neon.py` pass: success, idempotent-duplicate, pool-unavailable, swallows-db-exception
+- [x] `NeonBackend.append_raw_event` exists; wrapped in `_RLSTransaction`; uses ON CONFLICT DO NOTHING; returns None silently on failure
+- [x] `StorageBackend` Protocol declares `append_raw_event` with full type signature
+- [x] `SQLiteBackend.append_raw_event` is a no-op (debug-log) — local mode does not audit (Plan 006 covers local observability)
+- [x] Idempotency verified live: dup write of `(tenant, slack_inbound, msg_id)` returns None and does not double-write
+- [x] Live integration confirmed: NeonBackend writes to real `raw_events` table; rows visible under RLS; check constraint blocks bad event_kind
+- [x] No regressions: `pytest tests/test_storage_neon.py tests/test_storage_sqlite.py -v` → 45 passed, 5 skipped (live-only), 0 failed
 
 ## Verification Steps
 
@@ -71,4 +70,8 @@ asyncio.run(smoke())
 ```
 
 ## Status
-Not started
+Complete — 2026-05-25 (scope reduced per STATUS.md adaptation; only `append_raw_event` was new code)
+
+### Adaptations + bugs found mid-execution
+- Original Phase B asked for 5 new methods; live inspection showed `get_or_create_conversation`, `append_message`, `get_conversation_history`, `search_sessions`, `_get_or_create_user` already shipped with Plan 001-D. Net new = 1 method (`append_raw_event`) + 4 tests.
+- **Idempotency bug surfaced + fixed during live integration**: Phase 007-A's dedup index keyed on `(tenant_id, conversation_id, event_kind, platform_message_id)` — but NULL `conversation_id` (events arriving before a conversation exists) made the index never fire (NULL ≠ NULL in Postgres uniqueness). Migration `007_raw_events_dedup_fix.sql` drops `conversation_id` from the dedup key. Verified: dup writes with same `(tenant, kind, msg_id)` now correctly return None; rows with NULL msg_id always insert.
