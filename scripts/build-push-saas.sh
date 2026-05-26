@@ -77,6 +77,7 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "[3/5] Building image: ${LOCAL_IMAGE}"
 docker build \
+    --platform linux/amd64 \
     --file "${REPO_ROOT}/Dockerfile.saas" \
     --tag "${LOCAL_IMAGE}" \
     --label "git-commit=$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
