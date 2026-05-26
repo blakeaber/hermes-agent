@@ -12,7 +12,7 @@
 | 007-A | Migration + schema (raw_events + RLS) | **Complete (2026-05-25)** | Migration applied to live Neon; raw_events with RLS + grants verified; 4 acceptance tests pass (insert, isolation, dual-tenant, idempotency) |
 | 007-B | NeonBackend session-entry CRUD + raw_events write | **Complete (2026-05-25)** | 1 new method (`append_raw_event`) + 4 unit tests + idempotency bug fix in migration 007. Live integration verified. |
 | 007-C | Slack adapter → Neon messages (saas mode) | **Complete (2026-05-25)** | Pivoted from SessionStore wiring to Slack-adapter hooks; both user + assistant turns persist via probe-verified path. JSONL-drop deferred to Plan 005. |
-| 007-D | Raw audit hooks (inbound + outbound + tool call) | **In progress** | Adds full-payload writes to raw_events at the same Slack adapter sites + tool executor |
+| 007-D | Raw audit hooks (inbound + outbound) — Slack adapter sites | **Complete (partial, 2026-05-25)** | Inbound+outbound shipped + verified end-to-end. Tool-call hook DEFERRED (sync/async bridge in tool_executor + Plan 006 overlap). |
 | 007-E | End-to-end UAT (Slack → Neon round-trip + restart survival) | Not started | Depends on 007-D |
 
 ## Resumption context

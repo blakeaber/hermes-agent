@@ -865,6 +865,22 @@ class SlackAdapter(BasePlatformAdapter):
                 except Exception as _e:
                     logger.debug("[Slack] Plan 007-C assistant-turn persist error: %s", _e)
 
+                # Plan 007-D: full-payload audit row to raw_events.
+                try:
+                    await self._neon_audit_event(
+                        chat_id=chat_id,
+                        thread_ts=thread_ts or None,
+                        event_kind="slack_outbound",
+                        platform_message_id=sent_ts,
+                        raw_payload={
+                            "content": content,
+                            "metadata": metadata or {},
+                            "raw_response": last_result,
+                        },
+                    )
+                except Exception as _e:
+                    logger.debug("[Slack] Plan 007-D outbound audit error: %s", _e)
+
             # Plan 004-A: register every Hermes output for feedback correlation.
             # Default skill_name to "_agent_default" when the response did not come
             # from an explicit skill — reactions on plain agent replies should still
@@ -1356,6 +1372,64 @@ class SlackAdapter(BasePlatformAdapter):
             text = text.replace(key, placeholders[key])
 
         return text
+
+    # ----- Plan 007-D: raw_events audit writes (saas mode) -----
+
+    async def _neon_audit_event(
+        self,
+        chat_id: str,
+        thread_ts: Optional[str],
+        event_kind: str,
+        platform_message_id: Optional[str],
+        raw_payload: Dict[str, Any],
+    ) -> None:
+        """
+        Append a row to the raw_events table (Plan 007-D compliance audit).
+
+        Best-effort: skips silently when saas mode is off OR tenant cache
+        is empty. Uses the conversation_id cache populated by Plan 007-C
+        when present (None otherwise — raw_events.conversation_id is
+        nullable by design for events that arrive before a conversation).
+
+        Payload is passed through agent.redact.redact_sensitive_text on
+        string values before write — secrets must NEVER land in raw_events.
+        """
+        pool = self._get_neon_pool()
+        if pool is None:
+            return
+        try:
+            team_id = (list(self._team_bot_user_ids.keys())[:1] or [""])[0]
+            tenant_id = self._tenant_id_by_team.get(team_id)
+            if not tenant_id:
+                return
+            import hermes_storage as _hs
+            backend = _hs._backend
+            if backend is None:
+                return
+            # Redact string fields in the payload before persisting.
+            from agent.redact import redact_sensitive_text
+            def _scrub(v):
+                if isinstance(v, str):
+                    return redact_sensitive_text(v)
+                if isinstance(v, dict):
+                    return {k: _scrub(vv) for k, vv in v.items()}
+                if isinstance(v, list):
+                    return [_scrub(x) for x in v]
+                return v
+            scrubbed = _scrub(raw_payload) if raw_payload else {}
+            conv_id = self._conv_id_by_chat.get((chat_id, thread_ts or ""))
+            await backend.append_raw_event(
+                tenant_id=tenant_id,
+                conversation_id=conv_id,
+                event_kind=event_kind,
+                platform_message_id=platform_message_id,
+                raw_payload=scrubbed,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[Slack] Plan 007-D raw audit failed (kind=%s msg_id=%s): %s",
+                event_kind, platform_message_id, exc,
+            )
 
     # ----- Plan 007-C: Slack message persistence to Neon (saas mode) -----
 
@@ -2507,6 +2581,18 @@ class SlackAdapter(BasePlatformAdapter):
             )
         except Exception as _e:
             logger.debug("[Slack] Plan 007-C user-turn persist error: %s", _e)
+
+        # Plan 007-D: full-payload audit row to raw_events.
+        try:
+            await self._neon_audit_event(
+                chat_id=channel_id,
+                thread_ts=thread_ts or None,
+                event_kind="slack_inbound",
+                platform_message_id=event.get("ts"),
+                raw_payload=event,  # the full Slack event dict — redacted inside the helper
+            )
+        except Exception as _e:
+            logger.debug("[Slack] Plan 007-D inbound audit error: %s", _e)
 
         # Per-channel ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt, resolve_channel_skills

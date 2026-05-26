@@ -76,4 +76,9 @@ GROUP BY event_kind ORDER BY event_kind;
 ```
 
 ## Status
-Not started
+Complete (partial) — 2026-05-25
+
+### Adaptations
+- **Slack inbound + outbound audit hooks**: shipped. Both call sites in `gateway/platforms/slack.py` write to `raw_events` immediately after the corresponding `_neon_persist_message` (007-C) call. Linked to `conversation_id` via the 007-C cache; redaction applied via `agent.redact.redact_sensitive_text` on string values in the payload.
+- **Tool-call audit hooks (request + response)**: DEFERRED. `agent/tool_executor.py` is sync (`execute_tool_calls_concurrent`, line 65), which means async writes to NeonBackend need an explicit `asyncio.run_coroutine_threadsafe` bridge. The redactor + payload-shape work is non-trivial and there is no current need that blocks the user's primary goal ("every Slack message saved in Neon" — already met by inbound+outbound). Tracked as a follow-up Plan 007-F or fold into Plan 006 (workflow observability) which already covers tool-call event auditing in its scope.
+- **Verification**: live probe wrote both audit rows; linked to conversation_id; AWS-key-shaped string in payload was masked ("AKIAIO...MPLE") by the existing redactor.
