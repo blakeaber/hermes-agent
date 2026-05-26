@@ -866,7 +866,15 @@ class SlackAdapter(BasePlatformAdapter):
                     logger.debug("[Slack] Plan 007-C assistant-turn persist error: %s", _e)
 
                 # Plan 007-D: full-payload audit row to raw_events.
+                # last_result is a slack_sdk SlackResponse object — extract .data
+                # (the JSON-decoded API response dict) so json.dumps doesn't
+                # choke inside NeonBackend.append_raw_event.
                 try:
+                    raw_response_data = None
+                    if last_result is not None:
+                        raw_response_data = getattr(last_result, "data", None)
+                        if raw_response_data is None and isinstance(last_result, dict):
+                            raw_response_data = last_result
                     await self._neon_audit_event(
                         chat_id=chat_id,
                         thread_ts=thread_ts or None,
@@ -875,11 +883,11 @@ class SlackAdapter(BasePlatformAdapter):
                         raw_payload={
                             "content": content,
                             "metadata": metadata or {},
-                            "raw_response": last_result,
+                            "raw_response": raw_response_data,
                         },
                     )
                 except Exception as _e:
-                    logger.debug("[Slack] Plan 007-D outbound audit error: %s", _e)
+                    logger.warning("[Slack] Plan 007-D outbound audit error: %s", _e)
 
             # Plan 004-A: register every Hermes output for feedback correlation.
             # Default skill_name to "_agent_default" when the response did not come
