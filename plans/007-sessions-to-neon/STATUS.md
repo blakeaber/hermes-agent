@@ -1,9 +1,32 @@
 # Status — Plan 007: Sessions to Neon
 
-**Status:** NOT STARTED
+**Status:** COMPLETE 2026-05-25
 **Last updated:** 2026-05-25
-**Blocked by:** None — first phase is migration-only and unblocked immediately
-**Blocks:** Plan 005 (Fargate cutover) cannot ship cleanly until 007 lands — cloud Fargate has no persistent disk
+**Blocked by:** None
+**Blocks:** Nothing — Plan 005 (Fargate cutover) is now unblocked
+
+## Final summary
+
+Plan 007 shipped end-to-end. Every Slack interaction now durably persists to Neon:
+- User + assistant message content → `messages` table (Plan 007-C)
+- Full event payloads (post-redaction) → `raw_events` table (Plan 007-D)
+- 👍/👎 reactions → `skill_feedback` table (Plan 004-A, now wired end-to-end)
+- Skill output correlation → `skill_output_map` table (Plan 004-A)
+
+Live UAT 007-E results (2026-05-25 22:14 round-2 interaction):
+- 19 messages rows | 18 outbound audit + 1 inbound audit | 1 reaction | 19 skill_output_map
+- Restart-survival proven: cold-start probe loaded 5 messages from Neon using explicit tenant_id
+
+7 commits on `feat/plan-004-self-improvement` branch:
+- `6d341a7` 007-A migration
+- `3d8a300` 007-B NeonBackend.append_raw_event + dedup-fix
+- `5fca860` 007-C Slack adapter → Neon messages
+- `c0fd092` 007-C docs
+- `54738a1` 007-D raw_events audit hooks
+- `cdffedd` 007-D SlackResponse.data fix
+- (current) 007-E get_conversation_history fix
+
+External actions Blake completed: applied Neon migrations 006+007 via owner DSN (inline only, not persisted), added `reactions:read` + reaction event subscriptions to the Slack app, reinstalled to workspace.
 
 ## Phase Progress
 
@@ -13,7 +36,7 @@
 | 007-B | NeonBackend session-entry CRUD + raw_events write | **Complete (2026-05-25)** | 1 new method (`append_raw_event`) + 4 unit tests + idempotency bug fix in migration 007. Live integration verified. |
 | 007-C | Slack adapter → Neon messages (saas mode) | **Complete (2026-05-25)** | Pivoted from SessionStore wiring to Slack-adapter hooks; both user + assistant turns persist via probe-verified path. JSONL-drop deferred to Plan 005. |
 | 007-D | Raw audit hooks (inbound + outbound) — Slack adapter sites | **Complete (partial, 2026-05-25)** | Inbound+outbound shipped + verified end-to-end. Tool-call hook DEFERRED (sync/async bridge in tool_executor + Plan 006 overlap). |
-| 007-E | End-to-end UAT (Slack → Neon round-trip + restart survival) | Not started | Depends on 007-D |
+| 007-E | End-to-end UAT (Slack → Neon round-trip + restart survival) | **Complete (2026-05-25)** | All Neon row counts green; surfaced + fixed 3 bugs (SlackResponse.data, reactions:read Slack scope, get_conversation_history cold-start) |
 
 ## Resumption context
 

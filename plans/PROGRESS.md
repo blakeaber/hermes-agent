@@ -8,7 +8,7 @@
 | 004 | Self-Improvement Service — Hermes↔Skills↔Atlas Feedback Loop | STUB (2026-05-18) — Stub plan only. No phases yet. Defines the boundary between Hermes agent behavior scoring, Skills Service promotion, and Atlas memory. Port 8002 (TBD). | 003 + Atlas 012 |
 | 005 | Hermes Fargate Cutover Stage 1 (gateway only) | DRAFT (2026-05-23) — 8 phases (A–H). Moves Hermes gateway to Fargate; MCPs stay local. **Blocked by Plan 007.** | 001-E + Plan 007 |
 | 006 | Workflow Observability — Task DAG, Rooben Verifier Surface, Linear Enrichment | DRAFT (2026-05-25) — Slack-surfaced workflow event log. SQLite locally, Neon in saas mode. | None |
-| 007 | Sessions to Neon — Compliance-Grade Audit + Cloud-Survivable State | NOT STARTED (2026-05-25) — 5 phases (A–E). Routes `SessionStore` writes through `NeonBackend` in `HERMES_MODE=saas`; adds `raw_events` audit table for every inbound/outbound/tool-call. Unblocks Plan 005. | 001-D |
+| 007 | Sessions to Neon — Compliance-Grade Audit + Cloud-Survivable State | **COMPLETE 2026-05-25** — All 5 phases shipped. Slack adapter persists user + assistant turns + raw audit + reactions to Neon. Live UAT: 19 messages + 19 outbound audit + 1 inbound audit + 1 reaction. Restart-survival proven. 7 commits on feat/plan-004-self-improvement. Surfaced + fixed 3 pre-existing bugs (SlackResponse.data, Slack scope, get_conversation_history cold-start). | 001-D |
 | 008 | MCPGateway Production Wiring — Pooled MCPs in Cloud Without Per-Worker Fan-Out | DRAFT (2026-05-25) — 6 phases (A–F). Audits + activates Plan 002-C's MCPGateway in gateway startup; deploys as Fargate sidecar so cloud Hermes can call MCP tools without per-session subprocess explosion. | Plan 005 soak passes |
 
 ## Active plans
