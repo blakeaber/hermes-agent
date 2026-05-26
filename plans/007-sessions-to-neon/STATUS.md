@@ -11,14 +11,14 @@
 |---|---|---|---|
 | 007-A | Migration + schema (raw_events + RLS) | **Complete (2026-05-25)** | Migration applied to live Neon; raw_events with RLS + grants verified; 4 acceptance tests pass (insert, isolation, dual-tenant, idempotency) |
 | 007-B | NeonBackend session-entry CRUD + raw_events write | **Complete (2026-05-25)** | 1 new method (`append_raw_event`) + 4 unit tests + idempotency bug fix in migration 007. Live integration verified. |
-| 007-C | SessionStore backend selection + JSONL drop in saas mode | **In progress** | Wires SessionStore.__init__ to NeonBackend when HERMES_MODE=saas |
-| 007-D | Raw audit hooks (inbound + outbound + tool call) | Not started | Depends on 007-C |
+| 007-C | Slack adapter → Neon messages (saas mode) | **Complete (2026-05-25)** | Pivoted from SessionStore wiring to Slack-adapter hooks; both user + assistant turns persist via probe-verified path. JSONL-drop deferred to Plan 005. |
+| 007-D | Raw audit hooks (inbound + outbound + tool call) | **In progress** | Adds full-payload writes to raw_events at the same Slack adapter sites + tool executor |
 | 007-E | End-to-end UAT (Slack → Neon round-trip + restart survival) | Not started | Depends on 007-D |
 
 ## Resumption context
 
-- Next phase: 007-B (in progress)
-- Adaptations recorded below — Phase B + C scope reduced after schema inspection.
+- Next phase: 007-D (in progress) — raw_events audit hooks
+- Adaptations recorded below — Phases A/B/C all completed with adapted scope per discovered ground truth.
 
 ## Open Questions (none blocking)
 
