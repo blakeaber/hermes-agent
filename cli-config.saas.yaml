@@ -10,18 +10,35 @@
 #   - Minimal: just what the cloud gateway needs. Plan 009 owns this file.
 
 model:
-  # Plan 010-B (2026-05-26): swap from Sonnet 4.6 to Llama 3.3 70B Bedrock
-  # for ~50-60% cost reduction + alignment with OSS-model thesis.
+  # 2026-05-28: swap from Llama 3.3 70B → Amazon Nova Pro.
   #
-  # Why 3.3-70B specifically: Llama 3.2 90B was marked LEGACY by AWS Bedrock
-  # mid-2026 (deprecation policy: "use it or lose it" — accounts that haven't
-  # called it in 30 days get ACCESS DENIED). Llama 3.1 70B has the same risk.
-  # Llama 3.3 70B is the current generation as of 2026-05-26 with confirmed
-  # tool-use support. Verified working via `aws bedrock-runtime converse`.
+  # Why the swap: Llama 3.3 on Bedrock supports `Converse` with tools and
+  # `ConverseStream` without tools, but NOT both together — calling
+  # ConverseStream with a tool config raises
+  #   ValidationException: This model doesn't support tool use in streaming mode.
+  # Hermes's conversation loop streams + uses tools (Slack-side mid-turn
+  # progress updates depend on streaming), so Llama can't carry the workload.
+  # The Plan 010-B note about "verified working via aws bedrock-runtime
+  # converse" was technically true for non-streaming Converse only.
+  #
+  # Why Nova Pro specifically:
+  #   - Streaming + tools fully supported on Bedrock Converse.
+  #   - ~$0.80 / $3.20 per M tokens (in / out) — roughly 1/8 the Sonnet 4
+  #     price, still cheaper than Llama 3.3 70B in absolute terms.
+  #   - Bedrock-native (no Portkey hop, no extra cred plumbing).
+  #   - Multimodal (text + image + video) — gives Hermes a headroom for
+  #     future Slack-image / Voice-memo inputs without a model swap.
+  #
+  # Why NOT Mistral Large 2: better OSS license posture but ~3x Nova Pro
+  # pricing, and the strict-OSS line isn't load-bearing for cloud Hermes
+  # right now. Revisit if Bedrock pricing shifts or if the OSS-thesis
+  # crystallises into a hard requirement (Plan 010-B revision).
   #
   # Rollback: change to us.anthropic.claude-sonnet-4-6 + rebuild + redeploy.
   # The bedrock_adapter call path is identical — only the model ID changes.
-  default: us.meta.llama3-3-70b-instruct-v1:0
+  # IAM (agentic-stack-hermes-task) already grants amazon.* + us.amazon.*
+  # ARNs as of 2026-05-28; revert is safe.
+  default: us.amazon.nova-pro-v1:0
   provider: bedrock
 
 # No providers / fallback_providers / credential_pool_strategies needed for
