@@ -30,18 +30,20 @@ from .orchestrator import (
     PHASE_ID_PATTERN,
     DRAIN_WORKFLOW_ID,
 )
+from .draft import handle_draft
 
 __all__ = [
     "register",
     "handle_resume",
     "handle_skip",
+    "handle_draft",
     "PHASE_ID_PATTERN",
     "DRAIN_WORKFLOW_ID",
 ]
 
 
 def register(ctx) -> None:
-    """Plugin entry point — registers /resume and /skip slash commands."""
+    """Plugin entry point — registers /resume, /skip, and /draft slash commands."""
     ctx.register_command(
         "resume",
         handler=handle_resume,
@@ -53,4 +55,12 @@ def register(ctx) -> None:
         handler=handle_skip,
         description="Mark a blocked orchestrator phase permanently Blocked.",
         args_hint="<phase_id>",
+    )
+    # Plan 030-A — Atlas-aware /draft skeleton. Atlas context fetch + LLM
+    # draft generation are stubbed; 030-B and 030-C fill them in.
+    ctx.register_command(
+        "draft",
+        handler=handle_draft,
+        description="Draft a follow-up email (Atlas-aware; 030-A skeleton).",
+        args_hint="<recipient> <context>",
     )

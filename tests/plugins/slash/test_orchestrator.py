@@ -233,7 +233,8 @@ def test_register_wires_both_commands() -> None:
 
     register(_Ctx())
 
-    assert set(registered) == {"resume", "skip"}
+    # Plan 030-A added /draft alongside /resume + /skip.
+    assert {"resume", "skip"}.issubset(set(registered))
     assert registered["resume"]["args_hint"] == "<phase_id>"
     assert registered["skip"]["args_hint"] == "<phase_id>"
     # Handlers are callable with a single str arg.
