@@ -1676,6 +1676,14 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("[Slack] Plan 026-C pin handler error: %s", exc)
 
+        # Plan 029-F — 🔄 / ⏭ / 🛑 on a phase_escalated DM signals the
+        # drainTierGraph workflow. Independent of 026-C and 004-A; an
+        # Atlas/Neon outage must not block drain control.
+        try:
+            await self._handle_drain_reaction(event)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("[Slack] Plan 029-F drain reaction handler error: %s", exc)
+
         pool = self._get_neon_pool()
         if pool is None:
             return  # Not in saas mode or pool unavailable; silently skip.
@@ -1807,6 +1815,98 @@ class SlackAdapter(BasePlatformAdapter):
                 atlas_bearer=atlas_token,
             ),
         )
+
+    async def _handle_drain_reaction(self, event: dict) -> None:
+        """Dispatch a 🔄 / ⏭ / 🛑 reaction to the drainTierGraph workflow.
+
+        Plan 029-F — extends the Plan 020-E `/resume` plugin so the
+        operator can react on a phase_escalated DM instead of typing
+        the slash command.
+
+        Filter chain (cheap → expensive):
+          1. Emoji name must be in ``ALL_RESUME_REACTIONS``.
+          2. Reactor must be in ``SLACK_ALLOWED_USERS``.
+          3. Reacted-to message body must contain ``[escalation]``.
+          4. For retry/skip, the body must contain a parseable phase_id.
+
+        Auth + classification + signalling all live in
+        ``plugins.slash.orchestrator.handle_reaction_event``; this
+        method only fetches the message body and parses the allowlist.
+        """
+        try:
+            from plugins.slash.orchestrator import (
+                ALL_RESUME_REACTIONS,
+                handle_reaction_event,
+            )
+        except Exception as exc:  # pragma: no cover - import failure is fatal
+            logger.warning("[Slack] orchestrator plugin import failed: %s", exc)
+            return
+
+        emoji_name = (event.get("reaction") or "").strip(": ")
+        if emoji_name not in ALL_RESUME_REACTIONS:
+            return  # 99.99% short-circuit path
+
+        item = event.get("item") or {}
+        channel = item.get("channel", "")
+        ts = item.get("ts", "")
+        reactor_user = event.get("user", "")
+        if not all([channel, ts, reactor_user]):
+            logger.debug("[Slack] 029-F: missing fields, skipping: %s", event)
+            return
+
+        # SLACK_ALLOWED_USERS gate — fail closed; `*` allows any user.
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if not allowed_csv:
+            logger.debug(
+                "[Slack] 029-F: SLACK_ALLOWED_USERS unset; dropping drain reaction"
+            )
+            return
+        allowed = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+        if "*" not in allowed and reactor_user not in allowed:
+            logger.debug(
+                "[Slack] 029-F: reactor %s not in SLACK_ALLOWED_USERS",
+                reactor_user,
+            )
+            return
+
+        # Fetch the reacted-to message body. conversations.history with
+        # latest=ts + inclusive=True + limit=1 is the documented pattern.
+        slack_client = self._get_client(channel)
+        try:
+            resp = await slack_client.conversations_history(
+                channel=channel, latest=ts, inclusive=True, limit=1
+            )
+            messages = (resp.get("messages") or []) if isinstance(resp, dict) else []
+            message_text = messages[0].get("text", "") if messages else ""
+        except Exception as exc:
+            logger.warning(
+                "[Slack] 029-F: conversations.history failed for %s/%s: %s",
+                channel, ts, exc,
+            )
+            return
+
+        # Wildcard `*` means "no allowlist applied at the plugin level"
+        # because the gateway already gated above; pass None so the
+        # plugin doesn't re-reject the gateway-approved user.
+        plugin_allowed = None if "*" in allowed else allowed
+        # Run the (sync) plugin handler off the event loop so the Slack
+        # gateway stays responsive while temporalio's blocking
+        # asyncio.run() is in flight.
+        loop = asyncio.get_running_loop()
+        note = await loop.run_in_executor(
+            None,
+            lambda: handle_reaction_event(
+                emoji_name=emoji_name,
+                message_text=message_text,
+                reactor_user_id=reactor_user,
+                allowed_users=plugin_allowed,
+            ),
+        )
+        if note:
+            logger.info(
+                "[Slack] 029-F drain reaction: emoji=%s user=%s -> %s",
+                emoji_name, reactor_user, note,
+            )
 
     # ----- Reactions -----
 
