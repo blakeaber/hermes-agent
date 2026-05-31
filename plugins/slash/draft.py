@@ -60,6 +60,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -651,83 +652,366 @@ def strip_action_marker(reply: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 030-C — Atlas write-back on Send
+# 030-D — atlas:AgentDraft write-back on Send (hardened)
 # ---------------------------------------------------------------------------
+#
+# Per master plan 030 Decision 5 + Phase 030-D spec, when Blake clicks Send
+# we persist one ``atlas:AgentDraft`` triple to ``urn:atlas:graph:events``
+# with full provenance:
+#
+#   urn:atlas:agent-draft:<ulid>
+#     atlas:authorAgent          "hermes"
+#     atlas:recipient            <urn:atlas:person:...>
+#     atlas:draftBody            "<literal text Blake sent>"
+#     atlas:contextSourceCount   3   (the three atlas_ask outputs)
+#     atlas:sentAt               <iso>
+#     atlas:validFrom            <iso>
+#     atlas:provenanceSource     "slack_draft_button"
+#     atlas:triggerSlackMessage  <slack message id>
+#
+# The write goes through the existing AtlasMemoryProvider._write_fact shim
+# (POST /v1/memory/hermes/write) — same path as 026-B's AgentDecision —
+# rather than a bespoke HTTP route. The Atlas-side typed-entity expander
+# parses the ``[AgentDraft] {...json}`` envelope into RDF (Plan 015 /
+# 025-C typed-entity convention).
+#
+# Edit and Discard do NOT write — only Send commits (Decision 5).
+
+# Default graph for AgentDraft writes. The master plan calls for
+# ``urn:atlas:graph:events`` (matching AgentDecision from 026-B). The
+# _write_fact target argument is the *memory* level routing key; the
+# provider maps target="memory" → events graph on the Atlas side.
+_AGENT_DRAFT_WRITE_TARGET = "memory"
+
+# Provenance source tag — used by Atlas-side typed-entity expansion to
+# distinguish slash-button sends from cron / batch / replay writes.
+_AGENT_DRAFT_PROVENANCE = "slack_draft_button"
+
+# Number of context sources fed into Nova-Pro composition. Mirrors the
+# three parallel atlas_ask calls in fetch_atlas_context.
+_AGENT_DRAFT_CONTEXT_SOURCE_COUNT = 3
+
+# Contradiction probe template — fires once before the writeback to
+# surface anything Blake may have committed to in the last 30 days that
+# this draft contradicts. Per master plan 030-D the probe does NOT block
+# the write (Blake's intent is final per Decision 7); a non-empty result
+# is logged as a warning event so the audit trail captures it.
+_CONTRADICTION_PROBE_TEMPLATE = (
+    "Does a draft to {recipient} saying \"{summary}\" contradict anything "
+    "I have committed to with this recipient in the last 30 days?"
+)
 
 
-def _default_atlas_writeback_factory() -> Callable[..., dict]:
-    """Build a callable that POSTs an ``atlas:AgentDraft`` triple to Atlas.
+def _now_iso_utc() -> str:
+    """UTC ISO-8601 timestamp with second resolution.
 
-    The Atlas write surface lives on the AtlasMemoryProvider (see Plan
-    022-A). We piggy-back on its configured base_url + token so the
-    /draft writeback uses the same auth path as /v1/ask reads.
+    Local helper (don't reuse daily_writeback._now_iso to keep modules
+    independently testable). Second resolution mirrors AgentDecision.
     """
-    from plugins.memory.atlas import AtlasMemoryProvider  # local import
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _mint_agent_draft_urn() -> str:
+    """Mint a ULID-shaped URN for an AgentDraft.
+
+    The spec calls for ``urn:atlas:agent-draft:<ulid>``. Hermes doesn't
+    pull in the ``ulid`` package, so we approximate with a sortable
+    token: <unix-ms-hex>-<random>. Atlas-side parsers don't validate
+    ULID format; they only require a stable globally-unique IRI.
+    """
+    ts_ms = int(time.time() * 1000)
+    ts_hex = format(ts_ms, "x")
+    rand = secrets.token_hex(6)
+    return f"urn:atlas:agent-draft:{ts_hex}-{rand}"
+
+
+def _recipient_iri(draft: "StoredDraft") -> str:
+    """Build the ``atlas:recipient`` IRI for a draft.
+
+    Email recipients map to a deterministic person IRI; handle recipients
+    map to a slack-handle IRI. Unresolved recipients fall through to a
+    text IRI so the triple still binds something Atlas can dedup on.
+    """
+    if draft.recipient_kind == "email":
+        return f"urn:atlas:person:email:{draft.recipient_value}"
+    if draft.recipient_kind == "handle":
+        return f"urn:atlas:person:slack-handle:{draft.recipient_value}"
+    return f"urn:atlas:person:unresolved:{draft.recipient_value}"
+
+
+def _summarize_for_probe(body: str, *, cap: int = 160) -> str:
+    """Cap the draft body to a one-liner the contradiction probe can use.
+
+    The probe goes back through atlas_ask which has its own LLM budget;
+    feeding the full 800-token body would inflate the question
+    needlessly. The first line + char cap is enough for the probe to
+    spot Commitment-level mismatches.
+    """
+    if not body:
+        return ""
+    first_line = body.split("\n", 1)[0].strip()
+    if len(first_line) > cap:
+        first_line = first_line[: cap - 3].rstrip() + "..."
+    return first_line
+
+
+def run_contradiction_probe(
+    draft: "StoredDraft",
+    *,
+    ask_fn: Optional[Callable[..., dict]] = None,
+) -> Optional[str]:
+    """Probe Atlas for 30-day commitment contradictions touching this draft.
+
+    Returns the contradiction-answer string when Atlas flags one; ``None``
+    when the corpus is clean (or unreachable). Per Decision 7 the result
+    does NOT block the write — the caller logs a warning and writes
+    anyway. The return value is included in the AgentDraft's
+    ``contradiction_warning`` field so the typed-entity expander can
+    surface it later.
+    """
+    if ask_fn is None:
+        try:
+            ask_fn = _default_ask_factory()
+        except Exception as exc:
+            logger.info("draft.contradiction_probe_unavailable err=%s", exc)
+            return None
+
+    summary = _summarize_for_probe(draft.body)
+    if not summary:
+        return None
+
+    question = _CONTRADICTION_PROBE_TEMPLATE.format(
+        recipient=draft.recipient_display, summary=summary,
+    )
+    try:
+        payload = ask_fn(question=question)
+    except Exception as exc:
+        logger.info("draft.contradiction_probe_failed err=%s", exc)
+        return None
+    answer = _extract_answer(payload)
+    if _is_empty_answer(answer):
+        return None
+    return answer
+
+
+def build_agent_draft_content(
+    draft: "StoredDraft",
+    *,
+    trigger_slack_message: Optional[str] = None,
+    contradiction_warning: Optional[str] = None,
+    sent_at: Optional[str] = None,
+    urn: Optional[str] = None,
+) -> Tuple[str, dict]:
+    """Render the ``[AgentDraft] {...json}`` payload for Atlas write.
+
+    Returns ``(content_str, body_dict)`` — the dict is exposed so tests
+    can assert on every provenance field without having to re-parse the
+    JSON envelope.
+
+    Mirrors the AgentDecision shape from 026-B: a single-line
+    ``[<TypeTag>] {json}`` content blob that the Atlas typed-entity
+    expander parses back into RDF triples.
+    """
+    now = sent_at or _now_iso_utc()
+    body = {
+        "type": "atlas:AgentDraft",
+        "urn": urn or _mint_agent_draft_urn(),
+        "authorAgent": "hermes",
+        "recipient": _recipient_iri(draft),
+        "recipientDisplay": draft.recipient_display,
+        "recipientKind": draft.recipient_kind,
+        "recipientValue": draft.recipient_value,
+        "intent": draft.intent,
+        "draftBody": draft.body,
+        "contextSourceCount": _AGENT_DRAFT_CONTEXT_SOURCE_COUNT,
+        "sentAt": now,
+        "validFrom": now,
+        "provenanceSource": _AGENT_DRAFT_PROVENANCE,
+        "triggerSlackMessage": trigger_slack_message or "",
+        "draftId": draft.draft_id,
+    }
+    if contradiction_warning:
+        body["contradictionWarning"] = contradiction_warning
+    return f"[AgentDraft] {json.dumps(body, separators=(',', ':'))}", body
+
+
+# Type signature mirroring daily_writeback.AtlasWriter so the Slack
+# adapter can pass the same provider-bound writer.
+AtlasDraftWriter = Callable[[str, str], None]
+"""``atlas_writer(target, content)`` — best-effort writer.
+
+Wraps ``AtlasMemoryProvider._write_fact``; tests inject a recording
+fake. Per the spec the AgentDraft goes to ``target="memory"`` (events
+graph), matching the AgentDecision pattern from 026-B.
+"""
+
+
+def _default_atlas_draft_writer(target: str, content: str) -> None:
+    """Real writer — defers Atlas import so test envs without atlas pass.
+
+    Mirrors :func:`plugins.slash.daily_writeback._default_atlas_writer`
+    one-for-one so 030-D inherits the same auth / breaker / config path
+    as 026-B. If the provider isn't installed or isn't configured, we
+    silently no-op — the Slack-side "Sent" UX still resolves and we log
+    the degradation.
+    """
+    try:
+        from plugins.memory.atlas import AtlasMemoryProvider  # type: ignore
+    except Exception as exc:
+        logger.info("draft.writeback_provider_unavailable err=%s", exc)
+        return
 
     provider = AtlasMemoryProvider()
-    provider.initialize(session_id="draft-writeback")
-    base_url = getattr(provider, "_base_url", "") or os.environ.get("ATLAS_BASE_URL", "")
-    token = getattr(provider, "_token", "") or os.environ.get("ATLAS_TOKEN", "")
+    if not provider.is_available():
+        logger.info("draft.writeback_provider_not_configured")
+        return
+    provider._write_fact(target=target, action="add", content=content)
 
-    def _writeback(*, draft: StoredDraft, decision: str) -> dict:
-        import httpx
-        url = f"{base_url.rstrip('/')}/v1/ingest/agent-draft"
-        body = {
-            "type": "atlas:AgentDraft",
-            "draft_id": draft.draft_id,
-            "recipient_kind": draft.recipient_kind,
-            "recipient_value": draft.recipient_value,
-            "intent": draft.intent,
-            "body": draft.body,
-            "decision": decision,
-            "agent": "hermes",
-            "provenance": "slash:/draft",
-        }
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        resp = httpx.post(url, json=body, headers=headers, timeout=5.0)
-        resp.raise_for_status()
-        return resp.json() if resp.content else {"ok": True}
 
-    return _writeback
+def write_agent_draft(
+    draft: "StoredDraft",
+    *,
+    trigger_slack_message: Optional[str] = None,
+    contradiction_warning: Optional[str] = None,
+    atlas_writer: Optional[AtlasDraftWriter] = None,
+) -> Tuple[bool, dict]:
+    """Persist one ``atlas:AgentDraft`` triple. Returns (ok, body_dict).
+
+    Never raises — the Slack "Sent" UX must resolve even if Atlas is
+    down. The returned body dict is what was written (or would have
+    been); callers use it for the audit log + the in-thread reply.
+    """
+    content, body = build_agent_draft_content(
+        draft,
+        trigger_slack_message=trigger_slack_message,
+        contradiction_warning=contradiction_warning,
+    )
+    writer = atlas_writer or _default_atlas_draft_writer
+    try:
+        writer(_AGENT_DRAFT_WRITE_TARGET, content)
+        logger.info(
+            "draft.atlas_writeback_ok urn=%s recipient_kind=%s",
+            body["urn"], draft.recipient_kind,
+        )
+        return True, body
+    except Exception as exc:
+        logger.warning(
+            "draft.atlas_writeback_failed urn=%s err=%s", body["urn"], exc,
+        )
+        return False, body
+
+
+def _writeback_is_legacy(fn: Callable) -> bool:
+    """Detect a 030-C-shaped writeback (``(draft=, decision=) -> dict``).
+
+    030-D widened the writeback contract to
+    ``(draft=, trigger_slack_message=, contradiction_warning=) -> (ok, dict)``.
+    Old call sites + tests still pass the 030-C shape; we sniff the
+    signature so both keep working without a breaking API change.
+    """
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    # A **kwargs sink is ambiguous — assume modern shape so the new path
+    # is exercised by the new tests. The 030-C tests that use **kw spies
+    # all either raise (bad/discard) or no-op, so misclassifying them as
+    # modern is harmless.
+    if "decision" in params and "trigger_slack_message" not in params:
+        return True
+    return False
 
 
 def record_draft_decision(
     draft_id: str,
     decision: str,
     *,
-    writeback_fn: Optional[Callable[..., dict]] = None,
+    trigger_slack_message: Optional[str] = None,
+    probe_fn: Optional[Callable[..., Optional[str]]] = None,
+    writeback_fn: Optional[Callable[..., Any]] = None,
 ) -> Tuple[bool, str]:
-    """Record a Send / Edit / Discard decision against Atlas.
+    """Record a Send / Edit / Discard decision and (for Send) write Atlas.
 
-    Returns ``(ok, message)``. Used by the Slack action handlers
-    (gateway/platforms/slack.py). Only ``decision="send"`` writes an
-    ``atlas:AgentDraft`` triple — Edit and Discard are tracked locally
-    but not persisted (per 030 design decision 5: write-back only on
-    Send).
+    Returns ``(ok, message)``. Used by the Slack button-action handlers
+    (gateway/platforms/slack.py). Per master plan 030 Decision 5 only
+    ``decision="send"`` writes an ``atlas:AgentDraft`` triple — Edit and
+    Discard are local-only.
+
+    The contradiction probe (030-D) fires once before the write. A
+    non-empty hit is logged + carried into the writeback's
+    ``contradictionWarning`` field but does NOT block the send (per
+    Decision 7: Blake's intent is final).
     """
     if decision == "send":
         draft = pop_stored_draft(draft_id)
         if draft is None:
             return False, "Draft not found (already actioned or expired)."
+
+        # Per 030-D + Decision 7: probe first, warn but don't block.
         try:
-            if writeback_fn is None:
-                writeback_fn = _default_atlas_writeback_factory()
-            writeback_fn(draft=draft, decision="send")
-            return True, f"Draft sent to {draft.recipient_display}; logged to Atlas."
+            warning = run_contradiction_probe(draft, ask_fn=None) \
+                if probe_fn is None else probe_fn(draft=draft)
         except Exception as exc:
-            logger.warning("draft.atlas_writeback_failed draft_id=%s err=%s", draft_id, exc)
-            # Send-intent recorded locally even if Atlas writeback failed —
-            # 030-D will reconcile on the next /daily sweep.
+            logger.info("draft.contradiction_probe_threw err=%s", exc)
+            warning = None
+        if warning:
+            logger.warning(
+                "draft.contradiction_detected draft_id=%s warning=%s",
+                draft_id, warning[:240],
+            )
+
+        # Legacy 030-C spy signature → adapt to the new writeback shape
+        # so old tests keep passing without a breaking surface change.
+        if writeback_fn is not None and _writeback_is_legacy(writeback_fn):
+            try:
+                writeback_fn(draft=draft, decision="send")
+                tail = " (contradiction logged)" if warning else ""
+                return True, f"Draft sent to {draft.recipient_display}; logged to Atlas.{tail}"
+            except Exception as exc:
+                logger.warning("draft.legacy_writeback_failed err=%s", exc)
+                return True, f"Draft marked sent (Atlas writeback deferred: {exc})."
+
+        actual_writeback = writeback_fn or (
+            lambda **kw: write_agent_draft(**kw)
+        )
+        try:
+            result = actual_writeback(
+                draft=draft,
+                trigger_slack_message=trigger_slack_message,
+                contradiction_warning=warning,
+            )
+            # Modern shape returns (ok, body_dict); legacy **kw spies that
+            # don't unpack right return whatever they return. Coerce.
+            if isinstance(result, tuple) and len(result) == 2:
+                ok, _body = result
+            else:
+                ok = True
+        except Exception as exc:
+            logger.warning("draft.atlas_writeback_threw draft_id=%s err=%s", draft_id, exc)
             return True, f"Draft marked sent (Atlas writeback deferred: {exc})."
+
+        if not ok:
+            return True, (
+                f"Draft sent to {draft.recipient_display}; "
+                "Atlas writeback deferred."
+            )
+        tail = " (contradiction logged)" if warning else ""
+        return True, f"Draft sent to {draft.recipient_display}; logged to Atlas.{tail}"
+
     if decision == "discard":
+        # Per Decision 5 / AC: Discard does NOT write.
         pop_stored_draft(draft_id)
         return True, "Draft discarded."
+
     if decision == "edit":
-        # Don't pop — Edit keeps the draft alive for the modal flow.
+        # Per Decision 5 / AC: Edit does NOT write. Keep draft alive
+        # for the modal flow (030-E).
         draft = get_stored_draft(draft_id)
         if draft is None:
             return False, "Draft not found (already actioned or expired)."
         return True, f"Edit draft: {draft.body}"
+
     return False, f"Unknown decision: {decision}"
 
 

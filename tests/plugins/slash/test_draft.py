@@ -790,3 +790,382 @@ def test_draft_store_evicts_oldest_when_soft_cap_exceeded(_clear_draft_store):
         assert ids[-1] in survivors
     finally:
         draft_mod._DRAFT_STORE_SOFT_CAP = original_cap
+
+
+# ---------------------------------------------------------------------------
+# Phase 030-D — atlas:AgentDraft write-back hardening + contradiction probe
+# ---------------------------------------------------------------------------
+#
+# 030-C shipped a minimal HTTP-POST writeback. 030-D hardens it to:
+#   * route through AtlasMemoryProvider._write_fact (matches 026-B
+#     AgentDecision pattern; same auth path) using the [AgentDraft] typed
+#     content envelope;
+#   * carry full provenance (authorAgent, recipient IRI, draftBody,
+#     contextSourceCount, sentAt, validFrom, provenanceSource,
+#     triggerSlackMessage);
+#   * run a contradiction probe before write; non-empty results are
+#     logged + carried in the triple but do NOT block the write
+#     (Decision 7: Blake's intent is final);
+#   * still write ONLY on Send — Edit and Discard never call writeback.
+
+import json  # noqa: E402
+import logging  # noqa: E402
+
+from plugins.slash.draft import (  # noqa: E402
+    _AGENT_DRAFT_PROVENANCE,
+    _AGENT_DRAFT_CONTEXT_SOURCE_COUNT,
+    _recipient_iri,
+    build_agent_draft_content,
+    run_contradiction_probe,
+    write_agent_draft,
+)
+
+
+def _make_stored_draft(
+    recipient_kind: str = "email",
+    recipient_value: str = "sarah@example.com",
+    recipient_display: str = "Sarah",
+    intent: str = "follow-up on the term sheet",
+    body: str = "Hi Sarah, quick follow-up on the term sheet. Blake",
+) -> StoredDraft:
+    return StoredDraft(
+        draft_id="testdraft1",
+        recipient_kind=recipient_kind,
+        recipient_value=recipient_value,
+        recipient_display=recipient_display,
+        intent=intent,
+        body=body,
+    )
+
+
+# --- AgentDraft content shape ----------------------------------------------
+
+
+def test_build_agent_draft_content_has_all_provenance_fields(_clear_draft_store):
+    """030-D AC: the [AgentDraft] envelope carries every spec'd field.
+
+    Master plan write-back shape (Phase 030-D):
+      atlas:authorAgent          "hermes"
+      atlas:recipient            <urn:atlas:person:...>
+      atlas:draftBody            "<literal text Blake sent>"
+      atlas:contextSourceCount   3
+      atlas:sentAt               <iso>
+      atlas:validFrom            <iso>
+      atlas:provenanceSource     "slack_draft_button"
+      atlas:triggerSlackMessage  <slack message id>
+    """
+    draft = _make_stored_draft()
+    content, body = build_agent_draft_content(
+        draft, trigger_slack_message="slack:C123:1700000000.123",
+    )
+    # Typed envelope tag — matches AgentDecision style
+    assert content.startswith("[AgentDraft] ")
+    payload_str = content[len("[AgentDraft] "):]
+    parsed = json.loads(payload_str)
+    assert parsed == body
+    # Every spec'd provenance field
+    assert body["type"] == "atlas:AgentDraft"
+    assert body["urn"].startswith("urn:atlas:agent-draft:")
+    assert body["authorAgent"] == "hermes"
+    assert body["recipient"] == "urn:atlas:person:email:sarah@example.com"
+    assert body["draftBody"] == draft.body
+    assert body["contextSourceCount"] == _AGENT_DRAFT_CONTEXT_SOURCE_COUNT == 3
+    assert body["provenanceSource"] == _AGENT_DRAFT_PROVENANCE == "slack_draft_button"
+    assert body["triggerSlackMessage"] == "slack:C123:1700000000.123"
+    # ISO-8601 timestamps with TZ
+    assert "T" in body["sentAt"]
+    assert body["validFrom"] == body["sentAt"]
+    # Intent + recipient pass-through for downstream rendering
+    assert body["intent"] == draft.intent
+    assert body["recipientDisplay"] == "Sarah"
+
+
+def test_recipient_iri_handles_email_handle_unresolved():
+    """Each recipient kind gets a deterministic IRI prefix."""
+    email_draft = _make_stored_draft(recipient_kind="email", recipient_value="a@b.io")
+    handle_draft = _make_stored_draft(
+        recipient_kind="handle", recipient_value="bossman2",
+        recipient_display="@bossman2",
+    )
+    unres_draft = _make_stored_draft(
+        recipient_kind="unresolved", recipient_value="garbage",
+        recipient_display="garbage",
+    )
+    assert _recipient_iri(email_draft) == "urn:atlas:person:email:a@b.io"
+    assert _recipient_iri(handle_draft) == "urn:atlas:person:slack-handle:bossman2"
+    assert _recipient_iri(unres_draft) == "urn:atlas:person:unresolved:garbage"
+
+
+def test_build_agent_draft_content_omits_warning_when_none():
+    """No probe hit → no contradictionWarning field (clean state)."""
+    draft = _make_stored_draft()
+    _content, body = build_agent_draft_content(draft, contradiction_warning=None)
+    assert "contradictionWarning" not in body
+
+
+def test_build_agent_draft_content_carries_warning_when_present():
+    draft = _make_stored_draft()
+    _content, body = build_agent_draft_content(
+        draft,
+        contradiction_warning="2 weeks ago you told Sarah Friday, this implies Monday",
+    )
+    assert "contradictionWarning" in body
+    assert "Friday" in body["contradictionWarning"]
+
+
+# --- write_agent_draft -----------------------------------------------------
+
+
+def test_write_agent_draft_calls_writer_with_typed_envelope():
+    """The writer must receive target='memory' (events graph) +
+    a single-line [AgentDraft] envelope (mirrors 026-B AgentDecision)."""
+    draft = _make_stored_draft()
+    calls: list[tuple[str, str]] = []
+
+    def _fake_writer(target: str, content: str) -> None:
+        calls.append((target, content))
+
+    ok, body = write_agent_draft(
+        draft,
+        trigger_slack_message="slack:Cx:1.2",
+        atlas_writer=_fake_writer,
+    )
+    assert ok is True
+    assert len(calls) == 1
+    target, content = calls[0]
+    assert target == "memory"  # events graph routing key (per 026-B pattern)
+    assert content.startswith("[AgentDraft] ")
+    # Body dict returned mirrors what was written
+    assert body["type"] == "atlas:AgentDraft"
+    assert body["triggerSlackMessage"] == "slack:Cx:1.2"
+
+
+def test_write_agent_draft_swallows_writer_failure():
+    """Per spec: writeback failures are logged but do not undo the Send.
+
+    The Slack 'Sent' UX must still resolve; the next /daily reconciles
+    drift. ``write_agent_draft`` returns ``(False, body)`` on failure
+    but never raises.
+    """
+    draft = _make_stored_draft()
+
+    def _bad_writer(target, content):
+        raise RuntimeError("atlas 503")
+
+    ok, body = write_agent_draft(draft, atlas_writer=_bad_writer)
+    assert ok is False
+    # Body still rendered so the caller can audit-log it
+    assert body["draftBody"] == draft.body
+
+
+# --- run_contradiction_probe -----------------------------------------------
+
+
+def test_contradiction_probe_returns_warning_when_atlas_flags_one():
+    """A non-empty Atlas answer → returned verbatim as the warning."""
+    draft = _make_stored_draft(body="Confirming Wednesday as the demo date.")
+
+    def _ask(*, question, **_):
+        return {"answer": "Yes — on 2026-05-01 you told Sarah Tuesday, not Wednesday."}
+
+    warning = run_contradiction_probe(draft, ask_fn=_ask)
+    assert warning is not None
+    assert "Tuesday" in warning
+
+
+def test_contradiction_probe_returns_none_on_empty_answer():
+    """Empty / "no records" answer → no warning (clean corpus)."""
+    draft = _make_stored_draft()
+
+    def _ask(*, question, **_):
+        return {"answer": "I don't have information on that."}
+
+    assert run_contradiction_probe(draft, ask_fn=_ask) is None
+
+
+def test_contradiction_probe_returns_none_when_atlas_unreachable():
+    """Atlas-side exception → swallow + return None (probe is best-effort)."""
+    draft = _make_stored_draft()
+
+    def _ask(*, question, **_):
+        raise RuntimeError("atlas down")
+
+    assert run_contradiction_probe(draft, ask_fn=_ask) is None
+
+
+def test_contradiction_probe_summarizes_long_drafts():
+    """Probe question caps the body to a one-liner (prompt-budget guard)."""
+    draft = _make_stored_draft(
+        body="Long line one with lots of detail.\n\nFollow-up paragraph two.\n\nMore.",
+    )
+    captured: list[str] = []
+
+    def _ask(*, question, **_):
+        captured.append(question)
+        return {"answer": ""}
+
+    run_contradiction_probe(draft, ask_fn=_ask)
+    assert len(captured) == 1
+    q = captured[0]
+    assert "Sarah" in q  # recipient threaded through
+    # First-line-only summary — paragraph two must not appear in the probe
+    assert "Follow-up paragraph two" not in q
+
+
+# --- record_draft_decision: Send / Edit / Discard write semantics ----------
+
+
+def test_record_decision_send_writes_via_new_writeback_with_provenance(_clear_draft_store):
+    """030-D AC: Send writes one AgentDraft triple with full provenance."""
+    reply = handle_draft(
+        "sarah@example.com ping",
+        ask_fn=_empty_ask,
+        compose_fn=lambda s, u: "Hi Sarah, ping.",
+    )
+    draft_id = extract_action_draft_id(reply)
+    captured: dict = {}
+
+    def _modern_writeback(*, draft, trigger_slack_message, contradiction_warning):
+        # Build the same envelope the production writer would
+        content, body = build_agent_draft_content(
+            draft,
+            trigger_slack_message=trigger_slack_message,
+            contradiction_warning=contradiction_warning,
+        )
+        captured["content"] = content
+        captured["body"] = body
+        return True, body
+
+    ok, msg = record_draft_decision(
+        draft_id, "send",
+        trigger_slack_message="slack:C1:1.0",
+        probe_fn=lambda **_: None,  # clean — no contradiction
+        writeback_fn=_modern_writeback,
+    )
+    assert ok is True
+    assert "Atlas" in msg or "logged" in msg
+    assert captured["body"]["authorAgent"] == "hermes"
+    assert captured["body"]["recipient"] == "urn:atlas:person:email:sarah@example.com"
+    assert captured["body"]["draftBody"] == "Hi Sarah, ping."
+    assert captured["body"]["contextSourceCount"] == 3
+    assert captured["body"]["provenanceSource"] == "slack_draft_button"
+    assert captured["body"]["triggerSlackMessage"] == "slack:C1:1.0"
+    # Clean probe → no warning field
+    assert "contradictionWarning" not in captured["body"]
+    # Send pops the draft (single-shot)
+    assert get_stored_draft(draft_id) is None
+
+
+def test_record_decision_send_writes_even_when_contradiction_detected(_clear_draft_store, caplog):
+    """030-D AC + Decision 7: probe hit logs a warning but does NOT block."""
+    reply = handle_draft(
+        "sarah@example.com ping",
+        ask_fn=_empty_ask,
+        compose_fn=lambda s, u: "Confirming Wednesday demo.",
+    )
+    draft_id = extract_action_draft_id(reply)
+    write_calls: list[dict] = []
+
+    def _writeback(*, draft, trigger_slack_message, contradiction_warning):
+        write_calls.append({"warning": contradiction_warning, "body": draft.body})
+        return True, {"ok": True}
+
+    def _probe(*, draft):
+        return "On 2026-05-01 Blake told Sarah Tuesday, not Wednesday."
+
+    with caplog.at_level(logging.WARNING):
+        ok, msg = record_draft_decision(
+            draft_id, "send",
+            probe_fn=_probe,
+            writeback_fn=_writeback,
+        )
+
+    assert ok is True
+    assert "contradiction logged" in msg
+    # The write still happened with the warning carried through
+    assert len(write_calls) == 1
+    assert write_calls[0]["warning"] is not None
+    assert "Tuesday" in write_calls[0]["warning"]
+    # Warning logged for the audit trail
+    assert any(
+        "contradiction_detected" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_record_decision_edit_does_not_call_writeback_or_probe(_clear_draft_store):
+    """030-D AC: Edit MUST NOT write to Atlas (only Send commits)."""
+    reply = handle_draft(
+        "sarah@example.com ping",
+        ask_fn=_empty_ask,
+        compose_fn=lambda s, u: "Hi Sarah.",
+    )
+    draft_id = extract_action_draft_id(reply)
+
+    def _writeback(**_):
+        raise AssertionError("Edit must not call writeback")
+
+    def _probe(**_):
+        raise AssertionError("Edit must not run contradiction probe")
+
+    ok, msg = record_draft_decision(
+        draft_id, "edit",
+        writeback_fn=_writeback,
+        probe_fn=_probe,
+    )
+    assert ok is True
+    # Draft stays alive in the store for the modal flow
+    assert get_stored_draft(draft_id) is not None
+    assert "Hi Sarah." in msg
+
+
+def test_record_decision_discard_does_not_call_writeback_or_probe(_clear_draft_store):
+    """030-D AC: Discard MUST NOT write to Atlas (only Send commits)."""
+    reply = handle_draft(
+        "sarah@example.com ping",
+        ask_fn=_empty_ask,
+        compose_fn=lambda s, u: "Hi.",
+    )
+    draft_id = extract_action_draft_id(reply)
+
+    def _writeback(**_):
+        raise AssertionError("Discard must not call writeback")
+
+    def _probe(**_):
+        raise AssertionError("Discard must not run contradiction probe")
+
+    ok, msg = record_draft_decision(
+        draft_id, "discard",
+        writeback_fn=_writeback,
+        probe_fn=_probe,
+    )
+    assert ok is True
+    assert "discard" in msg.lower()
+    # Draft popped (one-shot, no recovery)
+    assert get_stored_draft(draft_id) is None
+
+
+def test_record_decision_send_passes_trigger_slack_message_through(_clear_draft_store):
+    """Slack adapter passes a ``trigger_slack_message`` provenance id;
+    the writeback must receive it verbatim."""
+    reply = handle_draft(
+        "@bossman2 ping",
+        ask_fn=_empty_ask,
+        compose_fn=lambda s, u: "Yo.",
+    )
+    draft_id = extract_action_draft_id(reply)
+    captured: dict = {}
+
+    def _writeback(*, draft, trigger_slack_message, contradiction_warning):
+        captured["trigger"] = trigger_slack_message
+        captured["recipient"] = draft.recipient_value
+        return True, {}
+
+    ok, _msg = record_draft_decision(
+        draft_id, "send",
+        trigger_slack_message="slack:DXYZ:1700000000.42",
+        probe_fn=lambda **_: None,
+        writeback_fn=_writeback,
+    )
+    assert ok is True
+    assert captured["trigger"] == "slack:DXYZ:1700000000.42"
+    assert captured["recipient"] == "bossman2"

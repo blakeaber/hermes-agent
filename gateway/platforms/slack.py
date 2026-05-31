@@ -3081,9 +3081,16 @@ class SlackAdapter(BasePlatformAdapter):
         }
         decision = decision_map.get(action_id, "discard")
 
+        # Plan 030-D — pass the Slack message id as ``triggerSlackMessage``
+        # provenance so the atlas:AgentDraft triple is back-traceable to
+        # the click that committed it.
+        trigger_msg = f"slack:{channel_id}:{msg_ts}" if msg_ts else None
         try:
             from plugins.slash.draft import record_draft_decision
-            ok, result_msg = record_draft_decision(draft_id, decision)
+            ok, result_msg = record_draft_decision(
+                draft_id, decision,
+                trigger_slack_message=trigger_msg,
+            )
         except Exception as exc:
             logger.error("[Slack] draft-action dispatch failed: %s", exc, exc_info=True)
             ok, result_msg = False, f"Internal error: {exc}"
