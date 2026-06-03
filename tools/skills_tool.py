@@ -632,7 +632,21 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
     # get_all_skills_dirs() returns personal -> team -> global -> legacy order.
     # First-found-wins gives CSS-like scope precedence.
-    dirs_to_scan = [d for d in get_all_skills_dirs() if d.exists()]
+    candidate_dirs = list(get_all_skills_dirs())
+    # Include the module's SKILLS_DIR personal dir when it isn't already covered
+    # by get_all_skills_dirs(). In production SKILLS_DIR == get_skills_dir() (both
+    # HERMES_HOME/skills), so it's already in the list and this is a no-op. The
+    # guard exists so the personal dir is honored when SKILLS_DIR is overridden
+    # (e.g. tests patch `tools.skills_tool.SKILLS_DIR`) — get_all_skills_dirs()
+    # resolves the personal dir independently via get_skills_dir() and would
+    # otherwise miss it. Mirrors get_all_skills_dirs()'s own personal-fallback.
+    try:
+        covered = {d.resolve() for d in candidate_dirs}
+        if SKILLS_DIR.resolve() not in covered:
+            candidate_dirs.insert(0, SKILLS_DIR)
+    except OSError:
+        pass
+    dirs_to_scan = [d for d in candidate_dirs if d.exists()]
 
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
