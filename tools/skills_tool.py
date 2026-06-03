@@ -547,6 +547,53 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
+def _find_all_skills_via_service(
+    *, skip_disabled: bool = False
+) -> Optional[List[Dict[str, Any]]]:
+    """Plan 037-B: source skills from the Skills Service when configured.
+
+    Returns a list of skill-metadata dicts (same shape ``_find_all_skills``
+    produces locally) when ``HERMES_SKILLS_SERVICE_URL`` is set and the service
+    responds; returns ``None`` when no service is configured OR the request
+    fails, signalling the caller to fall back to local filesystem discovery.
+    """
+    from agent.skill_utils import skills_service_list
+
+    raw = skills_service_list()
+    if raw is None:
+        return None
+
+    # The /skills endpoint may return a bare list or a {"skills": [...]} wrapper.
+    entries = raw.get("skills", []) if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        return None
+
+    disabled = set() if skip_disabled else _get_disabled_skill_names()
+    mapped: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "")[:MAX_NAME_LENGTH]
+        if not name or name in disabled or name in seen:
+            continue
+        seen.add(name)
+        description = str(entry.get("description") or "")
+        if len(description) > MAX_DESCRIPTION_LENGTH:
+            description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
+        mapped.append(
+            {
+                "name": name,
+                "description": description,
+                # Service shape has no `category`; group by registry instead.
+                "category": entry.get("registry_name") or "general",
+                "scope": entry.get("scope") or "unknown",
+                "shadowing": entry.get("shadowing") or [],
+            }
+        )
+    return mapped
+
+
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
@@ -560,6 +607,16 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         shadowing (list of lower-priority scopes hidden by this entry).
         scope is one of "personal", "team", "global", or "unknown".
     """
+    # Plan 037-B: when a Skills Service is configured (HERMES_SKILLS_SERVICE_URL),
+    # source skills from it — realizing the "skills are a separate service"
+    # intent — and fall back to local filesystem discovery when it's unset or
+    # unreachable (skills_service_list returns None on both). Mirrors the Atlas
+    # gated-fallback pattern. All list callers (CLI `hermes skills list`, banner,
+    # web UI, config) flow through here, so they all benefit uniformly.
+    service_skills = _find_all_skills_via_service(skip_disabled=skip_disabled)
+    if service_skills is not None:
+        return service_skills
+
     from agent.skill_utils import (
         get_all_skills_dirs,
         get_skill_scope_for_path,
