@@ -51,6 +51,7 @@ def test_name_and_tools(provider):
         "atlas_ask",
         "atlas_contact",
         "atlas_open_contradictions",
+        "atlas_ingest_status",
     }
 
 
