@@ -170,6 +170,19 @@ MEMORY_GUIDANCE = (
     "workflows belong in skills, not memory."
 )
 
+ATLAS_ENVIRONMENT_GUIDANCE = (
+    "ENVIRONMENT & MEMORY: You run in Blake's personal cloud stack. Your long-term "
+    "memory is Atlas, reachable via your `atlas_ask` / `atlas_recall` tools. Blake's "
+    "email and calendar are AUTOMATICALLY ingested into Atlas on a schedule (you do not "
+    "ingest them yourself, and you hold no Google/Gmail/Calendar credentials or live "
+    "connectors of your own). So when Blake asks about his calendar, email, contacts, or "
+    "past activity, ANSWER BY CALLING `atlas_ask` — do NOT tell him to configure "
+    "credentials and do NOT claim to have Gmail/Calendar tools you don't have. If "
+    "`atlas_ask` returns nothing for a recent item, say the data may not be ingested yet "
+    "and offer to check ingestion status with `atlas_ingest_status` — do not ask Blake "
+    "for credentials."
+)
+
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
     "relevant cross-session context exists, use session_search to recall it before "

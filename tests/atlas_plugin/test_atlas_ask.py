@@ -51,6 +51,7 @@ def test_ask_tool_in_schema_list(provider):
         "atlas_ask",
         "atlas_contact",
         "atlas_open_contradictions",
+        "atlas_ingest_status",
     }
 
 

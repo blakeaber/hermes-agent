@@ -209,6 +209,17 @@ OPEN_CONTRADICTIONS_SCHEMA = {
     },
 }
 
+INGEST_STATUS_SCHEMA = {
+    "name": "atlas_ingest_status",
+    "description": (
+        "Report what data (email/calendar/contacts/etc.) is ingested into "
+        "Atlas and when it was last refreshed. Use this when Blake asks "
+        "whether his data is up to date or when atlas_ask returns nothing "
+        "for a recent item."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
 REMEMBER_SCHEMA = {
     "name": "atlas_remember",
     "description": (
@@ -413,6 +424,7 @@ class AtlasMemoryProvider(MemoryProvider):
             ASK_SCHEMA,
             CONTACT_SCHEMA,
             OPEN_CONTRADICTIONS_SCHEMA,
+            INGEST_STATUS_SCHEMA,
         ]
 
     def _ask(self, *, question: str, life_context: str | None = None,
@@ -508,6 +520,77 @@ class AtlasMemoryProvider(MemoryProvider):
                 filtered.append(r)
         return filtered
 
+    def _ingest_status(self) -> dict:
+        """GET /v1/stats — corpus + job + ingest aggregates (Atlas stats_routes).
+
+        Returns the parsed StatsResponse JSON verbatim. We read three slices:
+        - corpus.top_sources  → per-source chunk counts (what's in memory)
+        - jobs.last_7_days     → per-source ingest job activity (recent refresh)
+        - ingest.last_ingest_at / ingest_rate_last_7d_per_day → recency
+
+        This reuses the existing ATLAS_BASE_URL + bearer-token client surface;
+        no new Atlas endpoint is introduced. Raises on HTTP error.
+        """
+        import httpx
+        url = f"{self._base_url.rstrip('/')}/v1/stats"
+        resp = httpx.get(
+            url, headers=self._headers(), timeout=_READ_TIMEOUT_SECS + 3.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @staticmethod
+    def _format_ingest_status(stats: dict) -> str:
+        """Render /v1/stats into a one-paragraph human summary of what's ingested."""
+        corpus = stats.get("corpus") or {}
+        jobs = stats.get("jobs") or {}
+        ingest = stats.get("ingest") or {}
+
+        chunks_total = corpus.get("chunks_total") or 0
+        sources_total = corpus.get("sources_total") or 0
+        top_sources = corpus.get("top_sources") or []
+        last_7 = jobs.get("last_7_days") or {}
+        last_ingest_at = ingest.get("last_ingest_at")
+        rate = ingest.get("ingest_rate_last_7d_per_day") or 0.0
+
+        if not chunks_total and not top_sources and not last_7:
+            return (
+                "Atlas has nothing ingested yet — 0 chunks across 0 sources, and "
+                "no ingest jobs ran in the last 7 days. If you expect email or "
+                "calendar to be here, ingestion hasn't run."
+            )
+
+        parts: list[str] = [
+            f"Atlas holds {chunks_total} chunks across {sources_total} source(s)."
+        ]
+
+        if top_sources:
+            src_bits = ", ".join(
+                f"{s.get('source_iri', '?')} ({s.get('chunks', 0)} chunks)"
+                for s in top_sources[:6]
+            )
+            parts.append(f"Top sources: {src_bits}.")
+
+        if last_7:
+            recent_bits = ", ".join(
+                f"{src}: {cnt}" for src, cnt in sorted(
+                    last_7.items(), key=lambda kv: kv[1], reverse=True
+                )
+            )
+            parts.append(f"Ingest jobs in the last 7 days by source — {recent_bits}.")
+        else:
+            parts.append("No ingest jobs ran in the last 7 days.")
+
+        if last_ingest_at:
+            parts.append(
+                f"Most recent ingest: {last_ingest_at} "
+                f"(~{rate} items/day over the last week)."
+            )
+        else:
+            parts.append("No recorded last-ingest timestamp.")
+
+        return " ".join(parts)
+
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if self._is_breaker_open():
             return json.dumps({
@@ -578,6 +661,15 @@ class AtlasMemoryProvider(MemoryProvider):
             except Exception as e:
                 self._record_failure()
                 return tool_error(f"Atlas open-contradictions lookup failed: {e}")
+
+        elif tool_name == "atlas_ingest_status":
+            try:
+                stats = self._ingest_status()
+                self._record_success()
+                return json.dumps({"result": self._format_ingest_status(stats)})
+            except Exception as e:
+                self._record_failure()
+                return tool_error(f"Atlas ingest-status lookup failed: {e}")
 
         elif tool_name == "atlas_remember":
             content = args.get("content", "")
