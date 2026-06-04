@@ -933,6 +933,123 @@ def _serve_plugin_skill(
     )
 
 
+def _serve_service_skill(
+    name: str,
+    payload: Dict[str, Any],
+    *,
+    preprocess: bool = True,
+    session_id: str | None = None,
+) -> Optional[str]:
+    """Plan 039-A2: serve a skill loaded from the Skills Service.
+
+    ``payload`` is the JSON dict returned by
+    ``agent.skill_utils.skills_service_view`` — its ``content`` key holds the
+    full SKILL.md text.  Returns a JSON result string mirroring the local
+    ``skill_view`` contract (with ``skill_dir`` = None, since there is no local
+    directory), or ``None`` when the payload carries no usable content so the
+    caller falls back to the filesystem search.
+
+    Mirrors ``_serve_plugin_skill`` — applies the same platform/disabled guards,
+    injection scan, and preprocessing — so service-loaded and filesystem-loaded
+    skills behave identically.
+    """
+    if not isinstance(payload, dict):
+        return None
+    content = payload.get("content")
+    if not isinstance(content, str) or not content:
+        return None
+
+    parsed_frontmatter: Dict[str, Any] = {}
+    try:
+        parsed_frontmatter, _ = _parse_frontmatter(content)
+    except Exception:
+        parsed_frontmatter = {}
+
+    if not skill_matches_platform(parsed_frontmatter):
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Skill '{name}' is not supported on this platform.",
+                "readiness_status": SkillReadinessStatus.UNSUPPORTED.value,
+            },
+            ensure_ascii=False,
+        )
+
+    resolved_name = parsed_frontmatter.get("name", name)
+    if _is_skill_disabled(resolved_name):
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Skill '{resolved_name}' is disabled. "
+                    "Enable it with `hermes skills` or inspect the files directly on disk."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    # Injection scan — log but still serve (matches local-skill behaviour)
+    if any(p in content.lower() for p in _INJECTION_PATTERNS):
+        logger.warning(
+            "Service skill '%s' contains patterns that may indicate prompt injection",
+            name,
+        )
+
+    description = str(parsed_frontmatter.get("description", ""))
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
+
+    metadata = parsed_frontmatter.get("metadata")
+    hermes_meta = metadata.get("hermes", {}) or {} if isinstance(metadata, dict) else {}
+    tags = _parse_tags(hermes_meta.get("tags") or parsed_frontmatter.get("tags", ""))
+    related_skills = _parse_tags(
+        hermes_meta.get("related_skills")
+        or parsed_frontmatter.get("related_skills", "")
+    )
+
+    rendered_content = content
+    if preprocess:
+        try:
+            from agent.skill_preprocessing import preprocess_skill_content
+
+            # No local skill_dir — service skills are not directory-backed.
+            rendered_content = preprocess_skill_content(
+                content,
+                None,
+                session_id=session_id,
+            )
+        except Exception:
+            logger.debug(
+                "Could not preprocess service skill %s", name, exc_info=True
+            )
+
+    result = {
+        "success": True,
+        "name": resolved_name,
+        "description": description,
+        "tags": tags,
+        "related_skills": related_skills,
+        "content": rendered_content,
+        "path": str(payload.get("path") or name),
+        "skill_dir": None,
+        "linked_files": None,
+        "usage_hint": None,
+        "required_environment_variables": [],
+        "required_commands": [],
+        "missing_required_environment_variables": [],
+        "missing_credential_files": [],
+        "missing_required_commands": [],
+        "setup_needed": False,
+        "setup_skipped": False,
+        "readiness_status": SkillReadinessStatus.AVAILABLE.value,
+    }
+    if isinstance(metadata, dict):
+        result["metadata"] = metadata
+    if parsed_frontmatter.get("compatibility"):
+        result["compatibility"] = parsed_frontmatter["compatibility"]
+    return json.dumps(result, ensure_ascii=False)
+
+
 def skill_view(
     name: str,
     file_path: str = None,
@@ -1022,6 +1139,32 @@ def skill_view(
             # on-disk `category/skill` path during the local scan below.
             if bare:
                 local_category_name = f"{namespace}/{bare}"
+
+        # ── Skills Service first (Plan 039-A2: canonical-source keystone) ──
+        # When a Skills Service is configured (HERMES_SKILLS_SERVICE_URL), try
+        # loading the skill from it before scanning the local filesystem — so a
+        # skill that exists ONLY in the service (e.g. S3-backed canonical skills)
+        # can be LOADED, not just LISTED.  Mirrors the LIST path
+        # (`_find_all_skills_via_service` first, filesystem fallback).  Skipped
+        # for linked-file requests (file_path) since the service serves the
+        # SKILL.md body, not directory-backed reference/template/script files —
+        # those fall through to the filesystem scan unchanged.
+        if file_path is None:
+            from agent.skill_utils import skills_service_view
+
+            try:
+                service_payload = skills_service_view(name)
+            except Exception:
+                service_payload = None
+            if service_payload is not None:
+                served = _serve_service_skill(
+                    name,
+                    service_payload,
+                    preprocess=preprocess,
+                    session_id=task_id,
+                )
+                if served is not None:
+                    return served
 
         from agent.skill_utils import get_external_skills_dirs
 
