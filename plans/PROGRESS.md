@@ -31,3 +31,25 @@ Completed + corrected 2026-05-18. See `plans/CONSISTENCY-PASS.md` for full inven
 ## Completed plans (archived)
 
 _(none yet)_
+
+---
+
+## Inline sub-tasks (feedback triage — nightly, no new plan)
+
+### [BUG] Slack home channel not resolved at agent send time
+- **Source:** #product-feedback Slack message (ts: 1780166688.543969, user: U0B1DFUS1D2)
+- **Triage:** `bug`
+- **Symptom:** Hermes agent reports "no home channel has been set" at send time even though `SLACK_HOME_CHANNEL=D0B246RSJC8` is present in `~/.hermes/.env`. The gateway itself reads the env correctly (gateway.log shows it connected and uses D0B246RSJC8). The failure path appears to be in the agent-side `send_message` tool, which may load config independently of the gateway env vars.
+- **Suggested fix:** Verify that `~/.hermes/.env` is loaded before the `send_message` / Slack tool code path resolves `SLACK_HOME_CHANNEL`. Check `tools/` for any Slack send tool that independently reads env vs the gateway config.
+- **Effort:** S (< 1 day)
+- **Routing:** Fix in `tools/` or `gateway/platforms/slack.py` send path; no new phase needed.
+- **Added:** 2026-06-03 (nightly triage)
+
+### [UX] Hermes incorrectly refuses Atlas memory / cross-session recall with a privacy non-answer
+- **Source:** #product-feedback Slack message (ts: 1780166624.427729, user: U0B1DFUS1D2)
+- **Triage:** `ux`
+- **Symptom:** When asked about memories from other sessions or to reference Atlas, Hermes responds: "I'm sorry, but I can't share specific details about our past conversations due to privacy and security reasons." This is a hallucinated refusal — the memory tool and Atlas connector (atlas-012) exist and are intended to be used. The agent is either not receiving the Atlas context in its system prompt, or a safety heuristic in the system prompt is over-triggering.
+- **Suggested fix:** (a) Verify `memory_tool.py` and Atlas connector are registered in the agent's toolset and not accidentally gated. (b) Audit the system prompt / persona for overly cautious privacy language that could confuse the model. (c) Add an acceptance-test prompt: "What do you know about me from Atlas?" → should return actual memory content, not a refusal.
+- **Effort:** S–M (half day investigation + fix + test)
+- **Routing:** Could touch `tools/memory_tool.py`, `agent/` system prompt templates, or `hermes_constants.py` memory path resolution. No new phase needed — but if Atlas connector is simply not wired, may surface as a blocker for Plan 004 post-ship validation.
+- **Added:** 2026-06-03 (nightly triage)
