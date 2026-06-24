@@ -99,6 +99,20 @@ async def run_server(host: str = "0.0.0.0", port: int = 8080) -> None:
             _forge_exc,
         )
 
+    # Plan 074-C: register /clarify/ask (orchestrator → Slack thread relay) on
+    # this same server. Bearer-gated; posts the question via stateless
+    # chat.postMessage and persists a clarify_pending row for the gateway's
+    # reply handler. Same non-fatal posture as forge.
+    try:
+        from gateway.clarify_relay import register_clarify_routes  # noqa: PLC0415
+        register_clarify_routes(app)
+    except Exception as _clarify_exc:  # noqa: BLE001
+        logger.warning(
+            "Health server: clarify routes NOT registered (%s). "
+            "The orchestrator clarification relay will be unavailable.",
+            _clarify_exc,
+        )
+
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)
