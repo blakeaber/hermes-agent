@@ -13,8 +13,14 @@ in Slack block-kit shape. Sources (all via ``asyncio.gather`` with a
 
 2. **Inbox** — most-recent email threads, derived from the SAME
    ``GET /v1/today`` payload (``overdue_emails``). Calendar + inbox share
-   one fetch; the two ``_*_from_today`` derivers split it into two
-   ``SourceResult``s.
+   one fetch; the ``_*_from_today`` derivers split the payload.
+
+2b. **What's new in my world** — top recently-ingested entities grouped
+   by type (People / Orgs / Topics …), from the OPTIONAL
+   ``recent_entities`` field of the SAME ``/v1/today`` payload. The field
+   is optional on purpose: an Atlas that doesn't yet return it degrades
+   this section to ``empty`` (not ``error``), so the Hermes and Atlas
+   deploys stay decoupled.
 
 3. **Atlas open commitments** — ``atlas_ask`` with
    ``intent_hint="commitment_audit"``. Goes through the existing
@@ -125,6 +131,7 @@ class BriefBundle:
 
     calendar: SourceResult
     inbox: SourceResult
+    whats_new: SourceResult
     commitments: SourceResult
     contradictions: SourceResult
     contacts_overdue: SourceResult
@@ -233,36 +240,109 @@ def _inbox_from_today(payload: dict) -> SourceResult:
     return SourceResult(key="inbox", status=status, items=items, citations=citations)
 
 
-def _derive_calendar_inbox(
-    today_task: "asyncio.Task[dict]",
-) -> tuple[SourceResult, SourceResult]:
-    """Map the bounded ``/v1/today`` task into (calendar, inbox) results.
+# Display labels for the "what's new" entity-type groups, in render order.
+# Types not listed fall through to a title-cased version of the raw type.
+_ENTITY_TYPE_LABELS: tuple[tuple[str, str], ...] = (
+    ("Person", "People"),
+    ("Organization", "Orgs"),
+    ("Topic", "Topics"),
+    ("Commitment", "Commitments"),
+    ("CalendarEvent", "Events"),
+    ("Project", "Projects"),
+)
+_NAMES_PER_GROUP = 3
 
-    A cancelled task (fan-out budget exceeded) or a ``_status`` sentinel
-    (per-source timeout / transport error from ``_bounded_today``) degrades
-    BOTH sections identically — they share the one round-trip. Otherwise the
-    pure ``_*_from_today`` derivers run (which themselves handle the
+
+def _whats_new_from_today(payload: dict) -> SourceResult:
+    """Derive the "what's new in my world" SourceResult from ``/v1/today``.
+
+    Reads the OPTIONAL ``recent_entities`` field (top recently-ingested
+    entities, recency-ranked, each ``{iri, type, canonical_name, last_seen,
+    mentions}``) and groups them by type into one short line per group, e.g.
+    ``People: Pam Kavalam, Jane Doe (+2)``. The field is optional on purpose:
+    an older Atlas that doesn't yet return it degrades to ``empty`` (NOT
+    ``error``) so this section simply doesn't appear until the server ships
+    it — the two deploys stay decoupled.
+    """
+    if not isinstance(payload, dict):
+        return SourceResult(key="whats_new", status="error", error="non-dict today response")
+    recents = payload.get("recent_entities")
+    if not recents:  # None (field absent) or [] -> nothing to show, no error
+        return SourceResult(key="whats_new", status="empty")
+
+    # Group names by type, preserving the recency order they arrive in.
+    by_type: dict[str, list[str]] = {}
+    citations: list[str] = []
+    for e in recents:
+        if not isinstance(e, dict):
+            continue
+        name = str(e.get("canonical_name") or "").strip()
+        etype = str(e.get("type") or "").strip() or "Other"
+        if not name:
+            continue
+        by_type.setdefault(etype, []).append(name)
+        iri = str(e.get("iri") or "").strip()
+        if iri and len(citations) < 5:
+            citations.append(iri)
+
+    label_map = dict(_ENTITY_TYPE_LABELS)
+    type_order = [t for t, _ in _ENTITY_TYPE_LABELS] + sorted(
+        t for t in by_type if t not in label_map
+    )
+
+    items: list[str] = []
+    for etype in type_order:
+        names = by_type.get(etype)
+        if not names:
+            continue
+        label = label_map.get(etype, etype)
+        shown = names[:_NAMES_PER_GROUP]
+        overflow = len(names) - len(shown)
+        line = f"{label}: {', '.join(shown)}"
+        if overflow > 0:
+            line += f" (+{overflow})"
+        items.append(line)
+
+    status = "ok" if items else "empty"
+    return SourceResult(
+        key="whats_new", status=status, items=tuple(items), citations=tuple(citations)
+    )
+
+
+def _derive_today_sections(
+    today_task: "asyncio.Task[dict]",
+) -> tuple[SourceResult, SourceResult, SourceResult]:
+    """Map the bounded ``/v1/today`` task into (calendar, inbox, whats_new).
+
+    All three sections share the one round-trip. A cancelled task (fan-out
+    budget exceeded) or a ``_status`` sentinel (per-source timeout / transport
+    error from ``_bounded_today``) degrades ALL THREE identically. Otherwise
+    the pure ``_*_from_today`` derivers run (which themselves handle the
     breaker-open ``{"error": ...}`` payload and the normal case).
     """
+    keys = ("calendar", "inbox", "whats_new")
     if today_task.cancelled():
-        ts = SourceResult(key="calendar", status="timeout", error="fan-out budget exceeded")
-        return ts, SourceResult(key="inbox", status="timeout", error="fan-out budget exceeded")
+        return tuple(  # type: ignore[return-value]
+            SourceResult(key=k, status="timeout", error="fan-out budget exceeded") for k in keys
+        )
     try:
         payload = today_task.result()
     except Exception as exc:  # noqa: BLE001
         err = f"{type(exc).__name__}: {exc}"
-        return (
-            SourceResult(key="calendar", status="error", error=err),
-            SourceResult(key="inbox", status="error", error=err),
+        return tuple(  # type: ignore[return-value]
+            SourceResult(key=k, status="error", error=err) for k in keys
         )
     sentinel = payload.get("_status") if isinstance(payload, dict) else None
     if sentinel in ("timeout", "error"):
         err = str(payload.get("error") or sentinel)
-        return (
-            SourceResult(key="calendar", status=sentinel, error=err),
-            SourceResult(key="inbox", status=sentinel, error=err),
+        return tuple(  # type: ignore[return-value]
+            SourceResult(key=k, status=sentinel, error=err) for k in keys
         )
-    return _calendar_from_today(payload), _inbox_from_today(payload)
+    return (
+        _calendar_from_today(payload),
+        _inbox_from_today(payload),
+        _whats_new_from_today(payload),
+    )
 
 
 async def _default_today_fetch() -> dict:
@@ -536,8 +616,8 @@ async def _gather_brief(
         # Drain cancellations so the event loop isn't holding refs.
         await asyncio.gather(*all_tasks, return_exceptions=True)
 
-    # Derive calendar + inbox from the single /v1/today result.
-    calendar, inbox = _derive_calendar_inbox(today_task)
+    # Derive calendar + inbox + what's-new from the single /v1/today result.
+    calendar, inbox, whats_new = _derive_today_sections(today_task)
 
     results: dict[str, SourceResult] = {}
     for key, task in tasks.items():
@@ -553,6 +633,7 @@ async def _gather_brief(
     return BriefBundle(
         calendar=calendar,
         inbox=inbox,
+        whats_new=whats_new,
         commitments=results.get("commitments", SourceResult(key="commitments", status="error", error="missing")),
         contradictions=results.get("contradictions", SourceResult(key="contradictions", status="error", error="missing")),
         contacts_overdue=results.get("contacts_overdue", SourceResult(key="contacts_overdue", status="error", error="missing")),
@@ -575,6 +656,7 @@ _RANK_ORDER: tuple[str, ...] = (
     "inbox",             # action items in flight
     "contradictions",    # graph hygiene
     "contacts_overdue",  # relationship maintenance
+    "whats_new",         # what the graph just learned (digest, not action)
     "orchestrator",      # background drain status
 )
 
@@ -584,6 +666,7 @@ def _bullet_label(key: str) -> str:
     return {
         "calendar": "📅 Calendar",
         "inbox": "📥 Inbox",
+        "whats_new": "🌐 What's new",
         "commitments": "✅ Commitments",
         "contradictions": "⚠ Contradictions",
         "contacts_overdue": "👥 Contacts overdue",
@@ -614,6 +697,7 @@ def synthesize_bullets(bundle: BriefBundle) -> tuple[tuple[str, str, tuple[str, 
     sources_by_key = {
         "calendar": bundle.calendar,
         "inbox": bundle.inbox,
+        "whats_new": bundle.whats_new,
         "commitments": bundle.commitments,
         "contradictions": bundle.contradictions,
         "contacts_overdue": bundle.contacts_overdue,
@@ -706,6 +790,7 @@ def build_blocks(bundle: BriefBundle) -> dict:
     source_order = (
         ("calendar", bundle.calendar),
         ("inbox", bundle.inbox),
+        ("whats_new", bundle.whats_new),
         ("commitments", bundle.commitments),
         ("contradictions", bundle.contradictions),
         ("contacts_overdue", bundle.contacts_overdue),

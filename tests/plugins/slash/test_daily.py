@@ -206,6 +206,68 @@ def test_inbox_from_today_error_passthrough():
 
 
 # ---------------------------------------------------------------------------
+# "What's new in my world" — recent_entities (Phase 2b client side)
+# ---------------------------------------------------------------------------
+
+
+def _recent(name: str, etype: str, iri: str, last_seen: str = "2026-06-26T09:00:00+00:00", mentions: int = 1) -> dict:
+    return {
+        "iri": iri,
+        "type": etype,
+        "canonical_name": name,
+        "last_seen": last_seen,
+        "mentions": mentions,
+    }
+
+
+def test_whats_new_groups_by_type():
+    payload = _today_payload(
+        recent_entities=[
+            _recent("Pam Kavalam", "Person", "https://atlas/person/pam"),
+            _recent("Jane Doe", "Person", "https://atlas/person/jane"),
+            _recent("Hustle Fund", "Organization", "https://atlas/org/hustle"),
+        ]
+    )
+    sr = daily_mod._whats_new_from_today(payload)
+    assert sr.key == "whats_new"
+    assert sr.status == "ok"
+    joined = " || ".join(sr.items)
+    # People grouped together; org in its own group.
+    assert "Pam Kavalam" in joined and "Jane Doe" in joined
+    assert "Hustle Fund" in joined
+    people_line = next(i for i in sr.items if "Pam Kavalam" in i)
+    assert "People" in people_line
+    org_line = next(i for i in sr.items if "Hustle Fund" in i)
+    assert "Org" in org_line
+    # Citations carry entity IRIs.
+    assert "https://atlas/person/pam" in sr.citations
+
+
+def test_whats_new_caps_names_per_group_with_overflow():
+    payload = _today_payload(
+        recent_entities=[
+            _recent(f"Person {i}", "Person", f"https://atlas/person/{i}") for i in range(5)
+        ]
+    )
+    sr = daily_mod._whats_new_from_today(payload)
+    people_line = next(i for i in sr.items if "People" in i)
+    # Shows 3 names then a "+2" overflow marker.
+    assert "+2" in people_line
+
+
+def test_whats_new_empty_when_field_absent():
+    """An older Atlas that doesn't return recent_entities -> empty, NOT error."""
+    sr = daily_mod._whats_new_from_today(_today_payload())
+    assert sr.status == "empty"
+    assert sr.error == ""
+
+
+def test_whats_new_empty_when_list_empty():
+    sr = daily_mod._whats_new_from_today(_today_payload(recent_entities=[]))
+    assert sr.status == "empty"
+
+
+# ---------------------------------------------------------------------------
 # Atlas response parsing
 # ---------------------------------------------------------------------------
 
@@ -420,6 +482,32 @@ def test_gather_brief_today_timeout_marks_both_calendar_and_inbox():
     )
     assert bundle.calendar.status == "timeout"
     assert bundle.inbox.status == "timeout"
+    # what's-new shares the same /v1/today round-trip, so it degrades too.
+    assert bundle.whats_new.status == "timeout"
+
+
+def test_gather_brief_derives_whats_new_from_today():
+    payload = {
+        **_TODAY_OK,
+        "recent_entities": [
+            {
+                "iri": "https://atlas/person/pam",
+                "type": "Person",
+                "canonical_name": "Pam Kavalam",
+                "last_seen": "2026-06-26T09:00:00+00:00",
+                "mentions": 3,
+            }
+        ],
+    }
+    bundle = asyncio.run(
+        daily_mod._gather_brief(
+            atlas_ask=_make_atlas_ask({}),
+            today_fetcher=_make_today_fetch(payload),
+            orchestrator_base_url="",
+        )
+    )
+    assert bundle.whats_new.status == "ok"
+    assert any("Pam Kavalam" in i for i in bundle.whats_new.items)
 
 
 def test_gather_brief_today_error_propagates_to_both_sections():
@@ -509,6 +597,7 @@ def _bundle_with(**overrides) -> BriefBundle:
     defaults = dict(
         calendar=SourceResult("calendar", "empty"),
         inbox=SourceResult("inbox", "empty"),
+        whats_new=SourceResult("whats_new", "empty"),
         commitments=SourceResult("commitments", "empty"),
         contradictions=SourceResult("contradictions", "empty"),
         contacts_overdue=SourceResult("contacts_overdue", "empty"),
@@ -565,8 +654,8 @@ def test_build_blocks_returns_blocks_and_text_fallback():
     assert "blocks" in payload
     assert "text" in payload
     assert isinstance(payload["blocks"], list)
-    # header + top-line + divider + 6 sources + footer
-    assert len(payload["blocks"]) == 10
+    # header + top-line + divider + 7 sources + footer
+    assert len(payload["blocks"]) == 11
     assert payload["blocks"][0]["type"] == "header"
     assert payload["blocks"][-1]["type"] == "context"
     assert "Email Greg" in payload["text"]
