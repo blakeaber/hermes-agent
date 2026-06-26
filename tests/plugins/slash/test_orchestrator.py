@@ -216,7 +216,8 @@ def test_resume_handler_swallows_signal_errors(
 # ---------------------------------------------------------------------------
 
 
-def test_register_wires_both_commands() -> None:
+def test_register_wires_both_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_DRAIN_CONTROL", "1")  # resume/skip are gated; enable
     from plugins.slash import register
 
     registered: dict[str, dict] = {}

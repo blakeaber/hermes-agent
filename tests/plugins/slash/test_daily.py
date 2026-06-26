@@ -567,6 +567,8 @@ def test_register_wires_daily_command_without_breaking_others():
 
     assert "daily" in registered
     assert callable(registered["daily"]["handler"])
-    # Existing commands still register.
-    for name in ("resume", "skip", "draft"):
-        assert name in registered
+    # The other always-on command still registers.
+    assert "draft" in registered
+    # resume/skip are gated behind HERMES_DRAIN_CONTROL (off by default), so they
+    # are NOT registered here — see test_drain_control_gate.py.
+    assert "resume" not in registered and "skip" not in registered

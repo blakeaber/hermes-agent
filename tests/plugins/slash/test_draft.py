@@ -311,9 +311,9 @@ def test_register_wires_draft_command():
     assert "draft" in registered
     assert registered["draft"]["args_hint"] == "<recipient> <context>"
     assert callable(registered["draft"]["handler"])
-    # And the existing 020-E commands still register
-    assert "resume" in registered
-    assert "skip" in registered
+    # resume/skip are gated behind HERMES_DRAIN_CONTROL (off by default), so they
+    # are NOT registered here — see test_drain_control_gate.py.
+    assert "resume" not in registered and "skip" not in registered
 
 
 # ---------------------------------------------------------------------------

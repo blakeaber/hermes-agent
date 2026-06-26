@@ -29,6 +29,7 @@ from .orchestrator import (
     handle_skip,
     PHASE_ID_PATTERN,
     DRAIN_WORKFLOW_ID,
+    _drain_control_enabled,
 )
 from .draft import handle_draft
 from .daily import handle_daily
@@ -45,19 +46,28 @@ __all__ = [
 
 
 def register(ctx) -> None:
-    """Plugin entry point — registers /resume, /skip, and /draft slash commands."""
-    ctx.register_command(
-        "resume",
-        handler=handle_resume,
-        description="Retry a blocked orchestrator phase (signals drainTierGraph).",
-        args_hint="<phase_id>",
-    )
-    ctx.register_command(
-        "skip",
-        handler=handle_skip,
-        description="Mark a blocked orchestrator phase permanently Blocked.",
-        args_hint="<phase_id>",
-    )
+    """Plugin entry point — registers /draft, /daily, and (when drain control is
+    wired) /resume + /skip.
+
+    /resume + /skip signal the Temporal drain workflow, which requires
+    ``temporalio`` + a reachable ``TEMPORAL_HOST`` — neither present in this
+    deployment. Registering them anyway presented a broken surface (they failed
+    with a misleading "TEMPORAL_HOST unreachable"). They are now gated behind
+    ``HERMES_DRAIN_CONTROL`` (default off) so the menu only advertises what works.
+    """
+    if _drain_control_enabled():
+        ctx.register_command(
+            "resume",
+            handler=handle_resume,
+            description="Retry a blocked orchestrator phase (signals drainTierGraph).",
+            args_hint="<phase_id>",
+        )
+        ctx.register_command(
+            "skip",
+            handler=handle_skip,
+            description="Mark a blocked orchestrator phase permanently Blocked.",
+            args_hint="<phase_id>",
+        )
     # Plan 030-A — Atlas-aware /draft skeleton. Atlas context fetch + LLM
     # draft generation are stubbed; 030-B and 030-C fill them in.
     ctx.register_command(

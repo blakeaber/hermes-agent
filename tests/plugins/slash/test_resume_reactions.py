@@ -49,6 +49,13 @@ _ESCALATION_BODY = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _enable_drain_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise the drain-control-ENABLED behavior; turn the gate on.
+    (Default-off behavior is covered by test_drain_control_gate.py.)"""
+    monkeypatch.setenv("HERMES_DRAIN_CONTROL", "1")
+
+
 @pytest.fixture
 def captured(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
     """Replace the sync signal entrypoints with recorders."""

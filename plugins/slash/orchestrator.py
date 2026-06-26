@@ -117,6 +117,22 @@ def _temporal_web_url() -> str:
     return os.environ.get("TEMPORAL_WEB_URL", _DEFAULT_TEMPORAL_WEB_URL)
 
 
+def _drain_control_enabled() -> bool:
+    """Whether drain control (/resume, /skip, reaction signalling) is wired.
+
+    OFF by default: this Hermes image ships without ``temporalio`` and prod sets
+    no ``TEMPORAL_HOST``, so the signal path can't reach the drain workflow.
+    Rather than present commands that fail with a misleading "TEMPORAL_HOST
+    unreachable", we hide them (see ``plugins.slash.register``) and keep
+    reactions silent until the capability is actually wired. Flip
+    ``HERMES_DRAIN_CONTROL=1`` (and install temporalio + set TEMPORAL_HOST) to
+    re-enable.
+    """
+    return os.environ.get("HERMES_DRAIN_CONTROL", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 async def _signal_drain_workflow(phase_id: str, action: str) -> None:
     """Open a Temporal client and signal the drain workflow.
 
@@ -270,6 +286,12 @@ def handle_reaction_event(
         (wrong emoji, not an escalation message, missing phase_id,
         unauthorised reactor, or Temporal unreachable).
     """
+    # Honesty gate: when drain control isn't wired in this deployment, a 🔄/⏭/🛑
+    # reaction can't signal anything — stay silent rather than firing a dead
+    # Temporal call that returns a misleading ":x: signal failed" note.
+    if not _drain_control_enabled():
+        return None
+
     # Auth gate first — silent drop per AC4.
     if allowed_users is not None and reactor_user_id not in allowed_users:
         logger.debug(
