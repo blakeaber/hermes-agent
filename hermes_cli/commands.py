@@ -1016,7 +1016,18 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    # Second pass: aliases.
+    # Second pass: plugin commands. These are first-class user commands
+    # (e.g. /daily, /draft) and must win slots over mere aliases — so they
+    # run BEFORE the alias pass. Otherwise, when canonical names + /hermes
+    # already approach the 50-command cap, the alias pass would consume the
+    # remaining slots and the clamp in _add would silently drop every
+    # plugin command.
+    for name, description, args_hint in _iter_plugin_command_entries():
+        _add(name, description, args_hint or "")
+
+    # Third pass: aliases. Lowest priority — they fill whatever slots remain
+    # after canonical + plugin commands, and any dropped alias is still
+    # reachable via /hermes <alias>.
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
@@ -1024,10 +1035,6 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             # Skip aliases that only differ from canonical by case/punctuation
             # normalization (already covered by _add dedup).
             _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
-
-    # Third pass: plugin commands.
-    for name, description, args_hint in _iter_plugin_command_entries():
-        _add(name, description, args_hint or "")
 
     return entries
 

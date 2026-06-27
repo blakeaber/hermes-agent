@@ -15,6 +15,7 @@ from hermes_cli.commands import (
     _CMD_NAME_LIMIT,
     _SLACK_RESERVED_COMMANDS,
     _TG_NAME_LIMIT,
+    _SLACK_MAX_SLASH_COMMANDS,
     _clamp_command_names,
     _clamp_telegram_names,
     _sanitize_telegram_name,
@@ -1708,6 +1709,36 @@ class TestPluginCommandEnumeration:
         })
         mapping = slack_subcommand_map()
         assert mapping.get("metricas") == "/metricas"
+
+    def test_plugin_commands_survive_slash_clamp(self, monkeypatch):
+        """Regression: plugin slashes (e.g. /daily, /draft) must register even
+        when canonical names + aliases would otherwise exhaust Slack's 50-slot
+        cap. Plugin commands are first-class and run BEFORE the alias pass, so
+        the clamp drops aliases (reachable via /hermes <alias>), not plugins.
+        """
+        self._patch_plugin_commands(monkeypatch, {
+            "daily": {
+                "handler": lambda _a: "ok",
+                "description": "Morning briefing",
+                "args_hint": "",
+                "plugin": "blake-ops",
+            },
+            "draft": {
+                "handler": lambda _a: "ok",
+                "description": "Compose a context-rich draft",
+                "args_hint": "",
+                "plugin": "blake-ops",
+            },
+        })
+        slashes = slack_native_slashes()
+        names = {n for n, _d, _h in slashes}
+        # The cap must actually be binding for this to be a real regression test;
+        # if it isn't, the reorder is untested rather than wrong.
+        assert len(slashes) == _SLACK_MAX_SLASH_COMMANDS, (
+            "expected the 50-slot cap to be saturated so the clamp is exercised"
+        )
+        assert "daily" in names, "plugin /daily was dropped by the slash clamp"
+        assert "draft" in names, "plugin /draft was dropped by the slash clamp"
 
     def test_plugin_command_does_not_shadow_builtin_in_slack(self, monkeypatch):
         """If a plugin registers a name that collides with a built-in, the built-in mapping wins."""
