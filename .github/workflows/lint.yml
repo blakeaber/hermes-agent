@@ -15,12 +15,15 @@ on:
       - "**/*.md"
       - "docs/**"
       - "website/**"
+  # NOTE: deliberately NO paths-ignore on pull_request. `ruff enforcement
+  # (blocking)` is a REQUIRED status check on main; with paths-ignore, a
+  # docs-only PR never triggers this workflow → the required check never
+  # reports → GitHub auto-merge waits forever on a status that never arrives
+  # (wedged the executor's docs-only PRs #26/#28). Running on every PR is cheap
+  # (`ruff check .` on an unchanged tree passes in seconds) and guarantees the
+  # required check always reports, so no PR can be permanently stuck.
   pull_request:
     branches: [main]
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "website/**"
 
 permissions:
   contents: read
