@@ -3591,6 +3591,60 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:  # noqa: BLE001 - fail-soft UX
             logger.warning("[Slack] /work ephemeral post failed: %s", e)
 
+    # WIKI-SLACK P6-D — the /wiki <entity> mobile front door (read-only).
+    async def _handle_wiki_command(self, command: dict) -> None:
+        """Render a cited entity wiki page for ``/wiki <entity>`` (fail-soft).
+
+        Read-only chain: resolve the name → IRI, fetch the EntityPage from
+        Atlas, render Block Kit, post it. Atlas-unreachable / unknown-entity /
+        uncited-page all post a graceful ephemeral message rather than guessing
+        — never raises.
+        """
+        from gateway import atlas_wiki_client, wiki_surface
+
+        entity = (command.get("text") or "").strip()
+        channel_id = command.get("channel_id", "")
+        user_id = command.get("user_id", "")
+
+        if not entity:
+            await self._post_work_ephemeral(
+                channel_id, user_id, text="Usage: `/wiki <entity name>`"
+            )
+            return
+
+        iri = atlas_wiki_client.resolve_entity_iri(entity)
+        page = await atlas_wiki_client.fetch_entity_page(iri)
+
+        if page.get("degraded"):
+            await self._post_work_ephemeral(
+                channel_id, user_id,
+                text="Atlas is unreachable — showing nothing rather than guessing.",
+            )
+            return
+        if page.get("not_found"):
+            await self._post_work_ephemeral(
+                channel_id, user_id, text=f"No wiki page for *{entity}* yet.",
+            )
+            return
+
+        try:
+            blocks = wiki_surface.render_wiki_blocks(page)
+        except wiki_surface.UncitedSentenceError:
+            await self._post_work_ephemeral(
+                channel_id, user_id,
+                text=f"Atlas returned an uncited page for *{entity}* — withholding it.",
+            )
+            return
+
+        try:
+            await self._get_client(channel_id).chat_postMessage(
+                channel=channel_id,
+                text=f"Wiki: {entity}",
+                blocks=blocks,
+            )
+        except Exception as e:  # noqa: BLE001 - fail-soft UX
+            logger.warning("[Slack] /wiki post failed: %s", e)
+
     async def _handle_work_preset_action(self, ack, body, action) -> None:
         """A preset button was clicked — open the pre-filled dispatch modal."""
         await ack()
@@ -3731,6 +3785,13 @@ class SlackAdapter(BasePlatformAdapter):
         # never depends on LLM tool-selection (Plan 067 reason #2).
         if slash_name == "work":
             await self._handle_work_command(command)
+            return
+
+        # WIKI-SLACK P6-D — /wiki is a deterministic read-only surface (fetch +
+        # render a cited Atlas page), not an agent prompt. Intercept before the
+        # message/agent path so it never depends on LLM tool-selection.
+        if slash_name == "wiki":
+            await self._handle_wiki_command(command)
             return
 
         if slash_name in {"hermes", ""}:

@@ -118,6 +118,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # intercepts it BEFORE the agent loop (it is a Block Kit menu, not a prompt).
     CommandDef("work", "Launch autonomous work — preset menu + guided dispatch", "Session",
                gateway_only=True, args_hint="[help]"),
+    CommandDef("wiki", "Look up a cited Atlas wiki page for an entity", "Session",
+               gateway_only=True, args_hint="<entity>"),
 
     # Configuration
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
