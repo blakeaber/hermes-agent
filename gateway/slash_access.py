@@ -50,6 +50,7 @@ from typing import Any, FrozenSet, Iterable, Optional, Tuple
 _ALWAYS_ALLOWED_FOR_USERS: FrozenSet[str] = frozenset({
     "help",
     "whoami",
+    "wiki",  # WIKI-SLACK P6-D: read-only cited entity lookup — safe for all users
 })
 
 
