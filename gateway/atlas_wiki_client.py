@@ -27,6 +27,7 @@ ATLAS_ORG = "https://atlas.blakeaber.dev/org/"
 _SLUG_STRIP = re.compile(r"[^a-z0-9-]+")
 _SLUG_COLLAPSE = re.compile(r"-+")
 
+_READ_BASE_URL_ENV = "ATLAS_READ_BASE_URL"
 _BASE_URL_ENV = "ATLAS_BASE_URL"
 _TOKEN_ENV = "ATLAS_BEARER_TOKEN"
 _TIMEOUT_S = 8.0
@@ -62,7 +63,7 @@ async def fetch_entity_page(iri: str, *, viewer: str = "blake") -> dict[str, Any
     """
     import urllib.parse  # noqa: PLC0415
 
-    base = os.environ.get(_BASE_URL_ENV, "").strip().rstrip("/")
+    base = os.environ.get(_READ_BASE_URL_ENV, "").strip().rstrip("/") or os.environ.get(_BASE_URL_ENV, "").strip().rstrip("/")
     if not base:
         return {"degraded": True, "reason": f"{_BASE_URL_ENV} unset"}
 
