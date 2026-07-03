@@ -3729,6 +3729,13 @@ def mount_spa(application: FastAPI):
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str, request: Request):
         prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
+        # Unknown /api/* routes must 404 as JSON — never fall through to the SPA
+        # index. Returning 200 text/html for a missing endpoint silently breaks
+        # API consumers (the developer portal, generated clients) that key off
+        # the status code / content type. Real API routes are registered before
+        # this catch-all, so anything reaching here under /api/ is a genuine miss.
+        if full_path == "api" or full_path.startswith("api/"):
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
         file_path = WEB_DIST / full_path
         # Prevent path traversal via url-encoded sequences (%2e%2e/)
         if (
