@@ -17841,6 +17841,8 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     CHANNEL_DIR_EVERY = 5    # ticks - every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks - once per hour
     CURATOR_EVERY = 60       # ticks - poll hourly (inner gate handles the real cadence)
+    SELF_IMPROVE_EVERY = 60  # ticks - poll hourly (inner gate: daily jobs + weekly recommender)
+    DAILY_BRIEF_EVERY = 5    # ticks - poll every 5 min (inner gate: weekday, once/day at brief time)
 
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0
@@ -17909,6 +17911,31 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                 )
             except Exception as e:
                 logger.debug("Curator tick error: %s", e)
+
+        # Plan 004 self-improvement jobs (skill scoring, promotion DMs, drift
+        # alerts, weekly skill-gap recommendations). Like the Curator these are
+        # internally gated (daily / weekly) so the hourly poll only dispatches
+        # real work once per period. Neon-backed: a no-op in local/non-saas mode.
+        if tick_count % SELF_IMPROVE_EVERY == 0:
+            try:
+                from hermes_agent.self_improvement.scheduling import (
+                    maybe_run_self_improvement,
+                )
+                maybe_run_self_improvement(loop)
+            except Exception as e:
+                logger.debug("Self-improvement tick error: %s", e)
+
+        # Weekday morning brief — proactive DM the operator did not request.
+        # Polled every 5 min; the inner gate fires at most once per local day
+        # once the configured brief time passes. Mode-agnostic (stdlib Slack).
+        if tick_count % DAILY_BRIEF_EVERY == 0:
+            try:
+                from hermes_agent.self_improvement.scheduling import (
+                    maybe_run_daily_brief,
+                )
+                maybe_run_daily_brief()
+            except Exception as e:
+                logger.debug("Daily brief tick error: %s", e)
 
         stop_event.wait(timeout=interval)
     logger.info("Cron ticker stopped")

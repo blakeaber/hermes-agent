@@ -396,10 +396,18 @@ async def generate_skill_draft(
     from pathlib import Path as _Path
     import jinja2
 
-    api_key = portkey_api_key or os.environ.get("PORTKEY_API_KEY", "")
-    if not api_key:
+    # Prefer Portkey when configured (test injection or PORTKEY_API_KEY);
+    # otherwise fall back to a direct Anthropic call. The Portkey gateway path
+    # is being retired (Plan 009 Path A), so direct-provider is the supported
+    # default — this keeps skill drafting working in local and cloud without a
+    # Portkey deployment. Sonnet either way (tiered posture: strong model for
+    # skill generation).
+    portkey_key = portkey_api_key or os.environ.get("PORTKEY_API_KEY", "")
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not (portkey_key or anthropic_key):
         raise RuntimeError(
-            "PORTKEY_API_KEY not set. Cannot call LLM for skill generation."
+            "No LLM credential for skill generation. Set ANTHROPIC_API_KEY "
+            "(direct) or PORTKEY_API_KEY (gateway)."
         )
 
     async with pool.acquire() as conn:
@@ -450,13 +458,16 @@ async def generate_skill_draft(
     try:
         import anthropic
 
-        client = anthropic.Anthropic(
-            api_key=api_key,
-            base_url="https://api.portkey.ai",
-            default_headers={
-                "x-portkey-provider": "anthropic",
-            },
-        )
+        if portkey_key:
+            client = anthropic.Anthropic(
+                api_key=portkey_key,
+                base_url="https://api.portkey.ai",
+                default_headers={
+                    "x-portkey-provider": "anthropic",
+                },
+            )
+        else:
+            client = anthropic.Anthropic(api_key=anthropic_key)
         response = client.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=4096,
