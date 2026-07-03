@@ -103,6 +103,23 @@ class TestClarifyAuth:
         result = _check_clarify_auth(req)
         assert result is not None and result.status == 401
 
+    def test_auth_fails_closed_in_saas_when_token_unset(self, clear_bearer, monkeypatch):
+        """503 (fail closed) when HERMES_MODE=saas and the bearer token is unset."""
+        from gateway.clarify_relay import _check_clarify_auth
+        monkeypatch.setenv("HERMES_MODE", "saas")
+        req = MagicMock()
+        req.headers = {}
+        result = _check_clarify_auth(req)
+        assert result is not None and result.status == 503
+
+    def test_auth_open_in_local_when_token_unset(self, clear_bearer, monkeypatch):
+        """None (open in dev) when HERMES_MODE unset/local and token unset."""
+        from gateway.clarify_relay import _check_clarify_auth
+        monkeypatch.delenv("HERMES_MODE", raising=False)
+        req = MagicMock()
+        req.headers = {}
+        assert _check_clarify_auth(req) is None
+
 
 # ---------------------------------------------------------------------------
 # thread_ref parsing
@@ -260,15 +277,55 @@ class TestReplyRelay:
             )
 
         assert relayed is True
-        # DELETE ... RETURNING consumed the row
-        sql = conn.fetchrow.await_args.args[0]
-        assert "DELETE FROM clarify_pending" in sql
+        # peek: non-destructive SELECT read the pending row
+        select_sql = conn.fetchrow.await_args.args[0]
+        assert "SELECT" in select_sql.upper()
+        assert "clarify_pending" in select_sql
         assert conn.fetchrow.await_args.args[1] == "C1:1700.0001"
+        # delete: issued via conn.execute AFTER the post succeeded
+        delete_sql = conn.execute.await_args.args[0]
+        assert "DELETE FROM clarify_pending" in delete_sql
+        assert conn.execute.await_args.args[1] == "C1:1700.0001"
         # answer posted back, trimmed, with the echoed question
         kwargs = sensor_mock.call_args.kwargs
         assert kwargs["workflow_id"] == "wf-42"
         assert kwargs["answer"] == "blakeaber/agentic-hub"
         assert kwargs["question"] == "Which repo?"
+
+    @pytest.mark.asyncio
+    async def test_relay_post_failure_leaves_row_and_returns_false(self):
+        from gateway.clarify_relay import maybe_relay_clarify_reply
+
+        with patch("gateway.clarify_relay._peek_pending",
+                   new=AsyncMock(return_value={
+                       "workflow_id": "wf-42", "question": "Q", "identifier": None,
+                   })), \
+             patch("gateway.clarify_relay._post_reply_to_sensor",
+                   new=AsyncMock(return_value=False)), \
+             patch("gateway.clarify_relay._delete_pending", new=AsyncMock()) as del_mock:
+            relayed = await maybe_relay_clarify_reply(
+                channel_id="C1", thread_ts="1700.1", answer="ans",
+            )
+        assert relayed is False
+        del_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_relay_success_deletes_only_after_post(self):
+        from gateway.clarify_relay import maybe_relay_clarify_reply
+
+        with patch("gateway.clarify_relay._peek_pending",
+                   new=AsyncMock(return_value={
+                       "workflow_id": "wf-42", "question": "Q", "identifier": None,
+                   })), \
+             patch("gateway.clarify_relay._post_reply_to_sensor",
+                   new=AsyncMock(return_value=True)) as post_mock, \
+             patch("gateway.clarify_relay._delete_pending", new=AsyncMock()) as del_mock:
+            relayed = await maybe_relay_clarify_reply(
+                channel_id="C1", thread_ts="1700.1", answer="ans",
+            )
+        assert relayed is True
+        post_mock.assert_awaited_once()
+        del_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_relay_blank_answer_false(self):

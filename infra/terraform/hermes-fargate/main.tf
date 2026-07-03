@@ -13,7 +13,7 @@
 #      - Adds HERMES_MODE=saas, HERMES_HOME=/tmp/hermes-runtime
 #      - Adds NEON_DATABASE_URL injected from Secrets Manager
 #      - Adds S3_SKILLS_BUCKET + HERMES_SKILL_LOCKS_TABLE as env vars
-#      - Healthcheck: curl http://localhost:8080/health
+#      - Healthcheck: curl http://localhost:8080/healthz (pure liveness)
 #      - Image: ECR repo agentic-stack/hermes tagged with var.image_tag
 #   2. ECS service update: hermes in agentic-stack cluster
 #      - Points to the new task definition revision
@@ -278,10 +278,13 @@ resource "aws_ecs_task_definition" "hermes_saas" {
       mountPoints = []
       volumesFrom = []
 
-      # Healthcheck: GET /health from the lightweight health server.
+      # Healthcheck: GET /healthz (pure liveness; /health is dependency-coupled)
+      # from the lightweight health server. Using /healthz keeps container
+      # liveness decoupled from Neon/S3 so a transient dependency blip cannot
+      # recycle an otherwise-healthy task.
       # startPeriod=60s: gives the gateway time to initialise Neon pool.
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+        command     = ["CMD-SHELL", "curl -sf http://localhost:8080/healthz || exit 1"]
         interval    = 30
         timeout     = 10
         retries     = 3

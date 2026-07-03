@@ -145,6 +145,28 @@ class TestForgeAuth:
         assert result is not None
         assert result.status == 401
 
+    def test_auth_fails_closed_in_saas_when_token_unset(self, clear_forge_bearer, monkeypatch):
+        """503 (fail closed) when HERMES_MODE=saas and the bearer token is unset."""
+        from gateway.forge_server import _check_forge_auth
+        from unittest.mock import MagicMock
+
+        monkeypatch.setenv("HERMES_MODE", "saas")
+        req = MagicMock()
+        req.headers = {}
+        result = _check_forge_auth(req)
+        assert result is not None
+        assert result.status == 503
+
+    def test_auth_open_in_local_when_token_unset(self, clear_forge_bearer, monkeypatch):
+        """None (open in dev) when HERMES_MODE is unset/local and token unset."""
+        from gateway.forge_server import _check_forge_auth
+        from unittest.mock import MagicMock
+
+        monkeypatch.delenv("HERMES_MODE", raising=False)
+        req = MagicMock()
+        req.headers = {}
+        assert _check_forge_auth(req) is None
+
 
 # ---------------------------------------------------------------------------
 # GET /forge/candidates
@@ -170,10 +192,13 @@ class TestForgeCandidates:
 
         request = MagicMock()
         request.headers = {}
-        request.rel_url.query = {}
+        request.rel_url.query = {"tenant_id": "t1"}
 
         with patch("gateway.forge_server._get_pool", new=AsyncMock(return_value=pool)), \
-             patch("hermes_storage.get_backend", new=AsyncMock(return_value=backend)):
+             patch("hermes_storage.get_backend", new=AsyncMock(return_value=backend)), \
+             patch("hermes_storage.neon_backend._RLSTransaction", new=MagicMock(
+                 return_value=_async_cm()
+             )):
             from gateway.forge_server import handle_forge_candidates
             response = await handle_forge_candidates(request)
 
@@ -186,11 +211,41 @@ class TestForgeCandidates:
         assert data[0]["tenant_id"] == "t1"
 
     @pytest.mark.asyncio
+    async def test_candidates_requires_tenant_id_400(self, clear_forge_bearer):
+        """P5: 400 when the tenant_id query param is absent."""
+        request = MagicMock()
+        request.headers = {}
+        request.rel_url.query = {}
+
+        from gateway.forge_server import handle_forge_candidates
+        response = await handle_forge_candidates(request)
+        assert response.status == 400
+
+    @pytest.mark.asyncio
+    async def test_candidates_scopes_to_tenant(self, clear_forge_bearer):
+        """P5: the handler opens an _RLSTransaction scoped to the tenant_id param."""
+        pool, _ = _make_pool([])
+
+        request = MagicMock()
+        request.headers = {}
+        request.rel_url.query = {"tenant_id": "t1"}
+
+        rls_mock = MagicMock(return_value=_async_cm())
+        with patch("gateway.forge_server._get_pool", new=AsyncMock(return_value=pool)), \
+             patch("hermes_storage.neon_backend._RLSTransaction", rls_mock):
+            from gateway.forge_server import handle_forge_candidates
+            response = await handle_forge_candidates(request)
+
+        assert response.status == 200
+        # second positional arg to _RLSTransaction(conn, tenant_id) is the tenant
+        assert rls_mock.call_args.args[1] == "t1"
+
+    @pytest.mark.asyncio
     async def test_candidates_pool_unavailable_503(self, clear_forge_bearer):
         """503 when the pool raises (not in saas mode)."""
         request = MagicMock()
         request.headers = {}
-        request.rel_url.query = {}
+        request.rel_url.query = {"tenant_id": "t1"}
 
         with patch(
             "gateway.forge_server._get_pool",
@@ -293,7 +348,11 @@ class TestForgeDraft:
 class TestForgeScore:
     @pytest.mark.asyncio
     async def test_score_uses_thumbs_rate_from_db(self, clear_forge_bearer):
-        """Returns thumbs_rate_30d from skill_scores when available."""
+        """Historical thumbs_rate_30d surfaces as existing_health, NOT the verdict.
+
+        Post-P4: the submitted (structurally-valid) content drives value/passed;
+        the DB's historical rate is informational only.
+        """
         score_row = _FakeRecord(thumbs_rate_30d=0.85)
         pool, conn = _make_pool([score_row])
         conn.fetchrow = AsyncMock(return_value=score_row)
@@ -318,8 +377,58 @@ class TestForgeScore:
         assert response.status == 200
         import json
         data = json.loads(response.text)
-        assert data["value"] == pytest.approx(0.85)
-        assert data["passed"] is False  # 0.85 < 0.92 bar
+        assert data["existing_health"] == pytest.approx(0.85)
+        # structural score of the supplied (valid) content is the verdict
+        assert data["value"] == pytest.approx(0.95)
+        assert data["passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_score_db_error_fails_closed_503(self, clear_forge_bearer):
+        """P3: a skill_scores lookup failure returns 503 / passed=False (never rubber-stamp)."""
+        request = MagicMock()
+        request.headers = {}
+        request.json = AsyncMock(
+            return_value={
+                "skill_name": "s",
+                "tenant_id": "t1",
+                "content": "# S\n\n## Description\n" + "x" * 300,
+            }
+        )
+
+        with patch("gateway.forge_server._get_pool",
+                   new=AsyncMock(side_effect=Exception("neon down"))):
+            from gateway.forge_server import handle_forge_score
+            response = await handle_forge_score(request)
+
+        assert response.status == 503
+        import json
+        assert json.loads(response.text)["passed"] is False
+
+    @pytest.mark.asyncio
+    async def test_score_prioritizes_submitted_content_over_history(self, clear_forge_bearer):
+        """P4: a structurally-failing draft fails even if the old skill scored 0.99."""
+        score_row = _FakeRecord(thumbs_rate_30d=0.99)
+        pool, conn = _make_pool([score_row])
+        conn.fetchrow = AsyncMock(return_value=score_row)
+
+        request = MagicMock()
+        request.headers = {}
+        request.json = AsyncMock(
+            return_value={"skill_name": "my-skill", "tenant_id": "t1", "content": "too short"}
+        )
+
+        with patch("gateway.forge_server._get_pool", new=AsyncMock(return_value=pool)), \
+             patch("hermes_storage.neon_backend._RLSTransaction", new=MagicMock(
+                 return_value=_async_cm()
+             )):
+            from gateway.forge_server import handle_forge_score
+            response = await handle_forge_score(request)
+
+        assert response.status == 200
+        import json
+        data = json.loads(response.text)
+        assert data["passed"] is False
+        assert data["value"] != pytest.approx(0.99)
 
     @pytest.mark.asyncio
     async def test_score_heuristic_pass(self, clear_forge_bearer):
