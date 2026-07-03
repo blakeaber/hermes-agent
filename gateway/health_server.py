@@ -16,8 +16,10 @@ Why a separate process instead of a thread in the gateway?
     gateway separately via task timeout.
 
 Routes:
-  GET /health    — full dependency check (Neon + S3); used by ALB target group
-  GET /healthz   — alias for container-level "am I running" check (no dep check)
+  GET /health    — readiness/diagnostic (Neon + S3); NOT the container liveness
+                   probe (a dependency blip must not recycle a healthy task)
+  GET /healthz   — pure liveness ("am I running", no dep check); this is the ECS
+                   container health-check target
 
 Usage:
   python -m gateway.health_server [--port 8080] [--host 0.0.0.0]

@@ -87,7 +87,16 @@ def _check_clarify_auth(request: "aiohttp.web.Request") -> Optional["aiohttp.web
 
     expected = os.environ.get(_CLARIFY_BEARER_ENV, "")
     if not expected:
-        logger.debug("clarify_relay: bearer token not configured — allowing all requests")
+        if os.environ.get("HERMES_MODE", "local") == "saas":
+            logger.error(
+                "clarify_relay: %s unset while HERMES_MODE=saas — failing CLOSED",
+                _CLARIFY_BEARER_ENV,
+            )
+            return web.json_response(
+                {"error": "unauthorized", "detail": "clarify auth not configured"},
+                status=503,
+            )
+        logger.debug("clarify_relay: bearer token not configured — allowing all (local dev)")
         return None
 
     auth_header = request.headers.get("Authorization", "")
@@ -199,16 +208,13 @@ async def _store_pending(
         )
 
 
-async def _pop_pending(thread_ref: str) -> Optional[dict[str, Any]]:
-    """Fetch + delete the pending row for thread_ref. Returns the row or None.
-
-    Atomic via DELETE ... RETURNING so a duplicate reply can't double-fire.
-    """
+async def _peek_pending(thread_ref: str) -> Optional[dict[str, Any]]:
+    """Fetch (WITHOUT deleting) the pending row for thread_ref. Returns row or None."""
     pool = await _get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "DELETE FROM clarify_pending WHERE thread_ref = $1 "
-            "RETURNING workflow_id, question, identifier",
+            "SELECT workflow_id, question, identifier "
+            "FROM clarify_pending WHERE thread_ref = $1",
             thread_ref,
         )
     if row is None:
@@ -218,6 +224,15 @@ async def _pop_pending(thread_ref: str) -> Optional[dict[str, Any]]:
         "question": row["question"],
         "identifier": row["identifier"],
     }
+
+
+async def _delete_pending(thread_ref: str) -> None:
+    """Delete the pending row once its answer has been durably relayed."""
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM clarify_pending WHERE thread_ref = $1", thread_ref
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +309,7 @@ async def maybe_relay_clarify_reply(
 
     thread_ref = f"{channel_id}:{thread_ts}"
     try:
-        pending = await _pop_pending(thread_ref)
+        pending = await _peek_pending(thread_ref)
     except Exception as exc:  # noqa: BLE001
         logger.debug("clarify_relay: pending lookup failed for %s: %s", thread_ref, exc)
         return False
@@ -307,18 +322,25 @@ async def maybe_relay_clarify_reply(
         answer=answer,
         question=pending.get("question") or "",
     )
-    if ok:
-        logger.info(
-            "clarify_relay: relayed answer for workflow=%s thread=%s",
-            pending["workflow_id"], thread_ref,
-        )
-    else:
+    if not ok:
         logger.error(
-            "clarify_relay: FAILED to relay answer for workflow=%s thread=%s "
-            "(pending row already consumed)",
+            "clarify_relay: FAILED to relay answer for workflow=%s thread=%s — "
+            "leaving pending row intact for retry",
             pending["workflow_id"], thread_ref,
         )
-    # Either way, the message was a clarification answer — consume it.
+        return False
+
+    try:
+        await _delete_pending(thread_ref)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "clarify_relay: relayed but failed to delete pending row %s: %s",
+            thread_ref, exc,
+        )
+    logger.info(
+        "clarify_relay: relayed answer for workflow=%s thread=%s",
+        pending["workflow_id"], thread_ref,
+    )
     return True
 
 

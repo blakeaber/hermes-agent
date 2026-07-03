@@ -74,8 +74,17 @@ def _check_forge_auth(request: "aiohttp.web.Request") -> Optional["aiohttp.web.R
 
     expected = os.environ.get(_FORGE_BEARER_ENV, "")
     if not expected:
+        if os.environ.get("HERMES_MODE", "local") == "saas":
+            logger.error(
+                "forge_server: %s unset while HERMES_MODE=saas — failing CLOSED",
+                _FORGE_BEARER_ENV,
+            )
+            return web.json_response(
+                {"error": "unauthorized", "detail": "forge auth not configured"},
+                status=503,
+            )
         # No token configured — open (local/test mode only).
-        logger.debug("forge_server: bearer token not configured — allowing all requests")
+        logger.debug("forge_server: bearer token not configured — allowing all (local dev)")
         return None
 
     auth_header = request.headers.get("Authorization", "")
@@ -125,9 +134,10 @@ async def handle_forge_candidates(request: "aiohttp.web.Request") -> "aiohttp.we
     Response body: JSON list of {skill_name, slack_ts, conversation_id, tenant_id}.
 
     Implementation: direct SQL over skill_feedback JOIN skill_output_map,
-    RLS-scoped per tenant. Returns rows across ALL tenants (the forge worker
-    iterates tenants server-side — simpler than a per-tenant call pattern since
-    the workflow already groups by tenant_id in the returned payload).
+    RLS-scoped to the `tenant_id` query param; the forge worker calls this once
+    per tenant (it already groups by tenant_id in the returned payload). The
+    RLS policy on skill_feedback scopes the SELECT, so no tenant predicate is
+    needed in the WHERE clause.
     """
     import aiohttp.web as web  # noqa: PLC0415
 
@@ -135,7 +145,13 @@ async def handle_forge_candidates(request: "aiohttp.web.Request") -> "aiohttp.we
     if auth_err:
         return auth_err
 
+    tenant_id = request.rel_url.query.get("tenant_id", "").strip()
     since = request.rel_url.query.get("since", "")
+    if not tenant_id:
+        return web.json_response(
+            {"error": "missing_fields", "detail": "tenant_id query param is required"},
+            status=400,
+        )
 
     try:
         pool = await _get_pool()
@@ -143,42 +159,45 @@ async def handle_forge_candidates(request: "aiohttp.web.Request") -> "aiohttp.we
         logger.error("forge/candidates: pool not available: %s", exc)
         return web.json_response({"error": "service_unavailable", "detail": str(exc)}, status=503)
 
+    from hermes_storage.neon_backend import _RLSTransaction  # noqa: PLC0415
+
     try:
         async with pool.acquire() as conn:
-            if since:
-                rows = await conn.fetch(
-                    """
-                    SELECT
-                        sf.tenant_id::text AS tenant_id,
-                        sf.skill_name,
-                        sf.slack_ts,
-                        COALESCE(som.conversation_id::text, '') AS conversation_id
-                    FROM skill_feedback sf
-                    LEFT JOIN skill_output_map som
-                        ON som.tenant_id = sf.tenant_id
-                       AND som.slack_ts  = sf.slack_ts
-                    WHERE sf.reaction = 'thumbs_down'
-                      AND sf.reacted_at > $1::timestamptz
-                    ORDER BY sf.reacted_at DESC
-                    """,
-                    since,
-                )
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT
-                        sf.tenant_id::text AS tenant_id,
-                        sf.skill_name,
-                        sf.slack_ts,
-                        COALESCE(som.conversation_id::text, '') AS conversation_id
-                    FROM skill_feedback sf
-                    LEFT JOIN skill_output_map som
-                        ON som.tenant_id = sf.tenant_id
-                       AND som.slack_ts  = sf.slack_ts
-                    WHERE sf.reaction = 'thumbs_down'
-                    ORDER BY sf.reacted_at DESC
-                    """,
-                )
+            async with _RLSTransaction(conn, tenant_id):
+                if since:
+                    rows = await conn.fetch(
+                        """
+                        SELECT
+                            sf.tenant_id::text AS tenant_id,
+                            sf.skill_name,
+                            sf.slack_ts,
+                            COALESCE(som.conversation_id::text, '') AS conversation_id
+                        FROM skill_feedback sf
+                        LEFT JOIN skill_output_map som
+                            ON som.tenant_id = sf.tenant_id
+                           AND som.slack_ts  = sf.slack_ts
+                        WHERE sf.reaction = 'thumbs_down'
+                          AND sf.reacted_at > $1::timestamptz
+                        ORDER BY sf.reacted_at DESC
+                        """,
+                        since,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        """
+                        SELECT
+                            sf.tenant_id::text AS tenant_id,
+                            sf.skill_name,
+                            sf.slack_ts,
+                            COALESCE(som.conversation_id::text, '') AS conversation_id
+                        FROM skill_feedback sf
+                        LEFT JOIN skill_output_map som
+                            ON som.tenant_id = sf.tenant_id
+                           AND som.slack_ts  = sf.slack_ts
+                        WHERE sf.reaction = 'thumbs_down'
+                        ORDER BY sf.reacted_at DESC
+                        """,
+                    )
 
         candidates = [
             {
@@ -396,9 +415,11 @@ async def handle_forge_score(request: "aiohttp.web.Request") -> "aiohttp.web.Res
             status=400,
         )
 
-    SCORE_BAR = float(os.environ.get("FORGE_SCORE_BAR", "0.92"))
-
-    # Attempt to use the pre-aggregated thumbs_rate_30d from skill_scores.
+    # Fetch the historical thumbs_rate_30d as *supplementary* health data. This
+    # no longer drives the verdict (P4): the submitted `content` is always scored
+    # structurally so a revised draft can move its own score. A DB error here
+    # fails CLOSED (P3) rather than silently rubber-stamping via the heuristic.
+    existing_rate = None
     try:
         pool = await _get_pool()
         from hermes_storage.neon_backend import _RLSTransaction  # noqa: PLC0415
@@ -415,23 +436,21 @@ async def handle_forge_score(request: "aiohttp.web.Request") -> "aiohttp.web.Res
                 )
 
         if score_row and score_row["thumbs_rate_30d"] is not None:
-            value = float(score_row["thumbs_rate_30d"])
-            passed = value >= SCORE_BAR
-            diagnostic = (
-                ""
-                if passed
-                else f"thumbs_rate_30d {value:.2f} < bar {SCORE_BAR:.2f}"
-            )
-            logger.info(
-                "forge/score: skill=%s tenant=%s thumbs_rate_30d=%.2f passed=%s",
-                skill_name, tenant_id, value, passed,
-            )
-            return web.json_response({"value": value, "passed": passed, "diagnostic": diagnostic})
+            existing_rate = float(score_row["thumbs_rate_30d"])
 
     except Exception as exc:
-        logger.warning("forge/score: skill_scores lookup failed (%s) — falling back to heuristic", exc)
+        logger.error("forge/score: skill_scores lookup FAILED (%s) — failing closed", exc)
+        return web.json_response(
+            {
+                "value": 0.0,
+                "passed": False,
+                "diagnostic": f"score DB unavailable: {type(exc).__name__}",
+            },
+            status=503,
+        )
 
-    # Heuristic scorer for new drafts with no historical signal.
+    # Structural scorer of record (until the 048-F LLM judge lands). Always
+    # scores the SUBMITTED draft `content`, never the old skill's history.
     # Checks that the draft has structural markers expected in a valid SKILL.md.
     has_heading = content.startswith("#") or "\n#" in content
     is_long_enough = len(content) >= 200
@@ -457,10 +476,15 @@ async def handle_forge_score(request: "aiohttp.web.Request") -> "aiohttp.web.Res
         passed = False
 
     logger.info(
-        "forge/score: skill=%s heuristic value=%.2f passed=%s diagnostic=%r",
-        skill_name, value, passed, diagnostic,
+        "forge/score: skill=%s structural value=%.2f passed=%s diagnostic=%r existing_health=%s",
+        skill_name, value, passed, diagnostic, existing_rate,
     )
-    return web.json_response({"value": value, "passed": passed, "diagnostic": diagnostic})
+    return web.json_response({
+        "value": value,
+        "passed": passed,
+        "diagnostic": diagnostic,
+        "existing_health": existing_rate,  # informational; not the gate
+    })
 
 
 # ---------------------------------------------------------------------------

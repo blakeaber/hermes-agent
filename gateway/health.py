@@ -1,10 +1,11 @@
 """
 gateway/health.py — SaaS-mode dependency health checks.
 
-Returns a structured health dict consumed by:
-  - gateway/health_server.py  (HTTP GET /health response body)
-  - ECS container healthcheck (via curl -sf http://localhost:8080/health)
-  - ALB target group health checks
+Returns a structured health dict consumed by the HTTP GET /health
+readiness/diagnostic route (gateway/health_server.py). This dependency-coupled
+dict is NOT the container liveness probe — the ECS container health check curls
+the dependency-free /healthz route so a transient Neon/S3 blip cannot recycle an
+otherwise-healthy task.
 
 Response schema:
   {
