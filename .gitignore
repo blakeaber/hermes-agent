@@ -80,3 +80,5 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+# Plan 065 META-0 triage: terraform plan outputs are build artifacts, never commit
+*.tfplan
