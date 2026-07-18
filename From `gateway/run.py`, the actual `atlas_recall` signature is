@@ -1,0 +1,1 @@
+def atlas_recall(query: str, *, top_k: int = 5) -> str:
