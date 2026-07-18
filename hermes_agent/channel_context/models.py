@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 class ChannelType(str, Enum):
@@ -36,6 +36,8 @@ class ChannelContext:
     channel_id:
         A platform-specific identifier for the channel or conversation
         (e.g. a Slack channel ID such as ``C01234567``).
+    channel_name:
+        Human-readable name of the channel, if available (e.g. ``#general``).
     thread_id:
         Optional identifier for a thread within the channel.  For
         platforms that do not have threads this should be ``None``.
@@ -46,6 +48,11 @@ class ChannelContext:
         Human-readable name of the user, if available.
     message_id:
         Platform-specific identifier of the triggering message.
+    domain_tags:
+        Optional list of domain/topic tags associated with the channel
+        (e.g. ``["engineering", "oncall"]``).  Defaults to an empty list.
+    purpose:
+        Optional free-text description of the channel's purpose.
     extra:
         Arbitrary additional key/value pairs that a specific platform
         adapter may need to propagate (e.g. workspace ID, bot token
@@ -54,10 +61,13 @@ class ChannelContext:
 
     channel_type: ChannelType = ChannelType.UNKNOWN
     channel_id: Optional[str] = None
+    channel_name: Optional[str] = None
     thread_id: Optional[str] = None
     user_id: Optional[str] = None
     user_display_name: Optional[str] = None
     message_id: Optional[str] = None
+    domain_tags: List[str] = field(default_factory=list)
+    purpose: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
@@ -69,10 +79,13 @@ class ChannelContext:
         return {
             "channel_type": self.channel_type.value,
             "channel_id": self.channel_id,
+            "channel_name": self.channel_name,
             "thread_id": self.thread_id,
             "user_id": self.user_id,
             "user_display_name": self.user_display_name,
             "message_id": self.message_id,
+            "domain_tags": list(self.domain_tags),
+            "purpose": self.purpose,
             "extra": dict(self.extra),
         }
 
@@ -92,10 +105,13 @@ class ChannelContext:
         return cls(
             channel_type=channel_type,
             channel_id=data.get("channel_id"),
+            channel_name=data.get("channel_name"),
             thread_id=data.get("thread_id"),
             user_id=data.get("user_id"),
             user_display_name=data.get("user_display_name"),
             message_id=data.get("message_id"),
+            domain_tags=list(data.get("domain_tags") or []),
+            purpose=data.get("purpose"),
             extra=dict(data.get("extra") or {}),
         )
 
@@ -109,19 +125,25 @@ class ChannelContext:
         *,
         channel_id: str,
         user_id: str,
+        channel_name: Optional[str] = None,
         thread_id: Optional[str] = None,
         message_id: Optional[str] = None,
         user_display_name: Optional[str] = None,
+        domain_tags: Optional[List[str]] = None,
+        purpose: Optional[str] = None,
         **extra: Any,
     ) -> "ChannelContext":
         """Shorthand constructor for Slack channels."""
         return cls(
             channel_type=ChannelType.SLACK,
             channel_id=channel_id,
+            channel_name=channel_name,
             thread_id=thread_id,
             user_id=user_id,
             user_display_name=user_display_name,
             message_id=message_id,
+            domain_tags=list(domain_tags) if domain_tags is not None else [],
+            purpose=purpose,
             extra=extra,
         )
 
@@ -131,28 +153,43 @@ class ChannelContext:
         *,
         channel_id: str,
         user_id: str,
+        channel_name: Optional[str] = None,
         thread_id: Optional[str] = None,
         message_id: Optional[str] = None,
         user_display_name: Optional[str] = None,
+        domain_tags: Optional[List[str]] = None,
+        purpose: Optional[str] = None,
         **extra: Any,
     ) -> "ChannelContext":
         """Shorthand constructor for Feishu / Lark channels."""
         return cls(
             channel_type=ChannelType.FEISHU,
             channel_id=channel_id,
+            channel_name=channel_name,
             thread_id=thread_id,
             user_id=user_id,
             user_display_name=user_display_name,
             message_id=message_id,
+            domain_tags=list(domain_tags) if domain_tags is not None else [],
+            purpose=purpose,
             extra=extra,
         )
 
     @classmethod
-    def for_cli(cls, *, user_id: Optional[str] = None, **extra: Any) -> "ChannelContext":
+    def for_cli(
+        cls,
+        *,
+        user_id: Optional[str] = None,
+        domain_tags: Optional[List[str]] = None,
+        purpose: Optional[str] = None,
+        **extra: Any,
+    ) -> "ChannelContext":
         """Shorthand constructor for CLI invocations."""
         return cls(
             channel_type=ChannelType.CLI,
             user_id=user_id,
+            domain_tags=list(domain_tags) if domain_tags is not None else [],
+            purpose=purpose,
             extra=extra,
         )
 
