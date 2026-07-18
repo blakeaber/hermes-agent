@@ -1,5 +1,6 @@
 """Tests for artifact store functionality."""
 
+import time
 import pytest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -138,6 +139,8 @@ class TestArtifactStore:
             content={"key": "value"},
             artifact_type="test",
         )
+        # Sleep briefly to ensure updated_at timestamp is strictly greater
+        time.sleep(0.01)
         updated = temp_store.update(
             created.id,
             content={"key": "updated-value"},

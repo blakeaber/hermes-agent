@@ -59,7 +59,7 @@ class ArtifactStore:
         """Load artifacts from storage."""
         store_file = self.storage_path / "artifacts.json"
         if store_file.exists():
-            with open(store_file, "r") as f:
+            with open(store_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 for artifact_data in data:
                     artifact = Artifact.from_dict(artifact_data)
@@ -69,7 +69,7 @@ class ArtifactStore:
         """Save artifacts to storage."""
         store_file = self.storage_path / "artifacts.json"
         artifacts_data = [artifact.to_dict() for artifact in self._artifacts.values()]
-        with open(store_file, "w") as f:
+        with open(store_file, "w", encoding="utf-8") as f:
             json.dump(artifacts_data, f, indent=2)
 
     def create(
