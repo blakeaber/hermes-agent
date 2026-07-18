@@ -139,15 +139,17 @@ class TestArtifactStore:
             content={"key": "value"},
             artifact_type="test",
         )
-        # Sleep briefly to ensure updated_at timestamp is strictly greater
-        time.sleep(0.01)
+        # Capture the original updated_at before mutation since update() mutates in place
+        original_updated_at = created.updated_at
+        # Sleep to ensure the timestamp advances
+        time.sleep(0.05)
         updated = temp_store.update(
             created.id,
             content={"key": "updated-value"},
         )
         assert updated is not None
         assert updated.content == {"key": "updated-value"}
-        assert updated.updated_at > created.updated_at
+        assert updated.updated_at > original_updated_at
 
     def test_update_artifact_metadata(self, temp_store):
         """Test updating artifact metadata."""

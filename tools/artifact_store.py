@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -45,6 +45,11 @@ class Artifact:
         )
 
 
+def _utcnow_iso() -> str:
+    """Return current UTC time as ISO-8601 string with Z suffix."""
+    return datetime.now(tz=timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 class ArtifactStore:
     """Manages storage and retrieval of artifacts."""
 
@@ -81,7 +86,7 @@ class ArtifactStore:
     ) -> Artifact:
         """Create and store a new artifact."""
         artifact_id = str(uuid.uuid4())
-        now = datetime.utcnow().isoformat() + "Z"
+        now = _utcnow_iso()
         artifact = Artifact(
             id=artifact_id,
             name=name,
@@ -122,7 +127,7 @@ class ArtifactStore:
         if metadata is not None:
             artifact.metadata.update(metadata)
 
-        artifact.updated_at = datetime.utcnow().isoformat() + "Z"
+        artifact.updated_at = _utcnow_iso()
         self._save_artifacts()
         return artifact
 
