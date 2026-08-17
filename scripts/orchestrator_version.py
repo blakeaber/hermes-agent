@@ -7,7 +7,7 @@ Utility for printing version information in JSON format.
 import json
 import subprocess
 import sys
-from datetime import datetime, timezone
+import hermes_time
 
 
 def get_git_sha() -> str:
@@ -22,7 +22,7 @@ def get_python_version() -> str:
 
 def get_utc_time() -> str:
     """Return the current UTC time in ISO 8601 format."""
-    return datetime.now(timezone.utc).isoformat()
+    return hermes_time.now().isoformat()
 
 
 def main() -> None:

@@ -7,6 +7,7 @@ import json
 from unittest.mock import patch, MagicMock
 from io import StringIO
 from datetime import datetime, timezone
+import hermes_time
 
 import sys
 from pathlib import Path
@@ -53,3 +54,7 @@ class TestMain:
             "python_version": "3.9.5",
             "utc_time": "2023-04-01T12:00:00+00:00",
         }
+
+    @patch("hermes_time.now", return_value=datetime(2023, 4, 1, 12, 0, tzinfo=timezone.utc))
+    def test_get_utc_time_matches_datetime_now(self, mock_hermes_time_now):
+        assert get_utc_time() == "2023-04-01T12:00:00+00:00"
